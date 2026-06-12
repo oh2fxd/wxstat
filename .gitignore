@@ -1,0 +1,11 @@
+*.db
+*.iq
+*.csv
+*.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+check.py
+download.ashx*

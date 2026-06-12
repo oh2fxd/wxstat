@@ -39,15 +39,15 @@ Opens `http://localhost:8080`. The collector waits for sensor bursts
 
 ### Manual start
 ```bash
-python3 wx_collector.py &    # background: captures and stores
-python3 wx_server.py          # foreground: web dashboard
+TCP_PORT=8081 python3 wx_collector.py &    # background: captures, stores, TCP push
+python3 wx_server.py                        # foreground: web dashboard
 ```
 
 ## Project structure
 
 ```
 wxstat/
-├── wx_collector.py   # rtl_433 → SQLite data collector
+├── wx_collector.py   # rtl_433 → SQLite + optional TCP push
 ├── wx_server.py      # Flask web dashboard + JSON API
 ├── start.sh          # One-command launcher (Linux + macOS)
 ├── push.sh           # git commit + push helper
@@ -68,6 +68,64 @@ wxstat/
 The sensor was found at **868.3 MHz**. If yours is different, edit
 `RTL_CMD` in `wx_collector.py`. Common alternatives: 433.92, 915 MHz.
 
+## TCP push (ESP32)
+
+The collector can push readings over raw TCP — no broker, no libraries needed.
+ESP32 just opens a socket and reads newline-delimited JSON lines.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `TCP_PORT` | `0` (disabled) | Port to listen on for TCP clients |
+
+```bash
+TCP_PORT=8081 python3 wx_collector.py &
+```
+
+### Protocol
+Each reading is a single JSON line followed by `\n`. Clients connect, read, and
+receive a new line each time the sensor transmits (every ~60s). The format
+matches what `rtl_433` emits:
+
+```json
+{"time":"2026-06-12 19:36:52","model":"Fineoffset-WHx080","id":238,"temperature_C":16.5,"humidity":58,"wind_dir_deg":225,"wind_avg_km_h":0.0,"wind_max_km_h":1.224,"rain_mm":4.2,"battery_ok":1}
+```
+
+### ESP32 example (Arduino)
+```cpp
+#include <WiFi.h>
+
+const char* WX_HOST = "192.168.1.10";
+const uint16_t WX_PORT = 8081;
+
+WiFiClient client;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin("SSID", "password");
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  client.connect(WX_HOST, WX_PORT);
+}
+
+void loop() {
+  if (!client.connected()) {
+    client.connect(WX_HOST, WX_PORT);
+    delay(1000);
+    return;
+  }
+  while (client.available()) {
+    String line = client.readStringUntil('\n');
+    Serial.println(line);  // parse JSON here
+  }
+}
+```
+
+### Test from a terminal
+```bash
+nc <pi-ip> 8081       # prints a new JSON line every ~60s
+```
+
 ## Troubleshooting
 
 **`usb_claim_interface error -6`** — kernel drivers grabbed the SDR.
@@ -76,8 +134,3 @@ or run: `sudo rmmod dvb_usb_rtl28xxu`
 
 **No data after 5 minutes** — sensor batteries may be dead, or it's on
 a different frequency. Scan with: `rtl_433 -f 433.92M -s 250k -g 20`
-
-## Next (planned)
-
-- MQTT bridge
-- Export to CSV

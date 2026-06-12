@@ -9,3 +9,4 @@ venv/
 .env
 check.py
 download.ashx*
+push.sh

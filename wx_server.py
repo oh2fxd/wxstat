@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Flask web dashboard for weather station data."""
+import os
 import sqlite3
 from flask import Flask, g, jsonify, request
 
-DB = "/home/oh2fxd/toolbox/python/wxstat/wxstat.db"
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxstat.db")
 app = Flask(__name__)
 
 
@@ -46,10 +47,17 @@ def api_current():
 @app.route("/api/history")
 def api_history():
     limit = request.args.get("limit", 288, type=int)
+    since = request.args.get("since", type=int)
     db = get_db()
-    rows = db.execute(
-        "SELECT * FROM readings ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+    if since is not None:
+        rows = db.execute(
+            "SELECT * FROM readings WHERE id > ? ORDER BY id DESC LIMIT ?",
+            (since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM readings ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
     return jsonify([dict(r) for r in reversed(rows)])
 
 
@@ -62,7 +70,7 @@ def api_stats():
                MIN(humidity) as h_min, MAX(humidity) as h_max,
                MAX(wind_max_m_s) as w_max
         FROM readings
-        WHERE time >= date('now')
+        WHERE time >= date('now')  -- UTC, matches collector's datetime.now(timezone.utc)
     """).fetchone()
     return jsonify(dict(rows)) if rows else jsonify({})
 
@@ -298,80 +306,113 @@ function drawChart(canvasId, rows, key, label, color, fromColor) {
 }
 
 // ── Refresh loop ─────────────────────────────
+var lastId = 0;
+var failCount = 0;
+var historyRows = [];
+
 async function refresh() {
+  var ok = false;
   try {
     var r = await fetch('/api/current');
-    if (!r.ok) return;
-    var d = await r.json();
-    var t = d.temperature_C;
-    var h = d.humidity;
-    var ws = d.wind_avg_m_s;
-    var wg = d.wind_max_m_s;
-    var wd = d.wind_dir_deg;
-    var rain = d.rain_mm;
-    var dp = d.dew_point_C;
+    if (!r.ok) { failCount++; }
+    else {
+      ok = true;
+      var d = await r.json();
+      var t = d.temperature_C;
+      var h = d.humidity;
+      var ws = d.wind_avg_m_s;
+      var wg = d.wind_max_m_s;
+      var wd = d.wind_dir_deg;
+      var rain = d.rain_mm;
+      var dp = d.dew_point_C;
 
-    // Cards
-    document.getElementById('icon-temp').textContent = tempIcon(t);
-    document.getElementById('temp').innerHTML = (t != null ? t : '--') + '<span class="unit">°C</span>';
-    var fl = '';
-    if (t != null) {
-      if (t < 0) fl = 'Freezing'; else if (t < 10) fl = 'Chilly'; else if (t < 20) fl = 'Mild'; else if (t < 28) fl = 'Warm'; else fl = 'Hot';
+      // Cards
+      document.getElementById('icon-temp').textContent = tempIcon(t);
+      document.getElementById('temp').innerHTML = (t != null ? t : '--') + '<span class="unit">°C</span>';
+      var fl = '';
+      if (t != null) {
+        if (t < 0) fl = 'Freezing'; else if (t < 10) fl = 'Chilly'; else if (t < 20) fl = 'Mild'; else if (t < 28) fl = 'Warm'; else fl = 'Hot';
+      }
+      document.getElementById('feels').textContent = fl;
+
+      document.getElementById('icon-hum').textContent = humIcon(h);
+      document.getElementById('hum').innerHTML = (h != null ? h : '--') + '<span class="unit">%</span>';
+      document.getElementById('comfort').innerHTML = comfort(h);
+
+      document.getElementById('icon-wind').textContent = windIcon(wg);
+      document.getElementById('wind-dir').textContent = windDirStr(wd);
+      document.getElementById('wind-speed').textContent = (ws != null ? ws.toFixed(1) : '--') + ' avg / ' + (wg != null ? wg.toFixed(1) : '--') + ' gust m/s';
+      var bf = beaufort(ws);
+      document.getElementById('beaufort').innerHTML = bf ? '<span class="beaufort">' + bf[1] + ' ' + bf[0] + '</span>' : '';
+
+      document.getElementById('icon-dew').textContent = dewIcon(dp);
+      document.getElementById('dew').innerHTML = (dp != null ? dp : '--') + '<span class="unit">°C</span>';
+      var dn = '';
+      if (dp != null && t != null) {
+        var spread = t - dp;
+        if (spread < 2) dn = 'Fog likely';
+        else if (spread < 5) dn = 'Comfortable';
+        else dn = 'Dry air';
+      }
+      document.getElementById('dew-note').textContent = dn;
+
+      document.getElementById('icon-rain').textContent = rainIcon(rain);
+      document.getElementById('rain').innerHTML = (rain != null ? rain.toFixed(1) : '--') + '<span class="unit"> mm</span>';
+      document.getElementById('rain-bar').style.width = Math.min(100, ((rain||0) / 20) * 100) + '%';
+      drawCompass(wd);
+      document.getElementById('station-id').textContent = d.station_id || '--';
+
+      // Status
+      var age = (Date.now() / 1000) - (new Date(d.time + 'Z').getTime() / 1000);
+      var dot = document.getElementById('status-dot');
+      document.getElementById('age').textContent = age < 120 ? 'live' : Math.round(age / 60) + 'm ago';
+      dot.className = age > 300 ? 'status-dot stale' : 'status-dot';
+      document.getElementById('status-text').textContent = age > 300 ? 'Stale' : 'Live';
+
+      // Today's min/max
+      try {
+        var sr = await fetch('/api/stats');
+        var s = await sr.json();
+        document.getElementById('range-temp').textContent = s.t_min != null ? '↓ ' + s.t_min + '°  ↑ ' + s.t_max + '°' : '';
+        document.getElementById('range-hum').textContent = s.h_min != null ? '↓ ' + s.h_min + '%  ↑ ' + s.h_max + '%' : '';
+        document.getElementById('range-wind').textContent = s.w_max != null ? 'Gust max ' + s.w_max.toFixed(1) + ' m/s' : '';
+      } catch(e) {}
     }
-    document.getElementById('feels').textContent = fl;
+  } catch(e) { failCount++; }
 
-    document.getElementById('icon-hum').textContent = humIcon(h);
-    document.getElementById('hum').innerHTML = (h != null ? h : '--') + '<span class="unit">%</span>';
-    document.getElementById('comfort').innerHTML = comfort(h);
+  // ── Connection status ──────────────────────
+  if (ok) {
+    failCount = 0;
+  } else if (failCount >= 2) {
+    document.getElementById('status-dot').className = 'status-dot stale';
+    document.getElementById('status-text').textContent = 'Offline';
+    document.getElementById('age').textContent = '—';
+  }
 
-    document.getElementById('icon-wind').textContent = windIcon(wg);
-    document.getElementById('wind-dir').textContent = windDirStr(wd);
-    document.getElementById('wind-speed').textContent = (ws != null ? ws.toFixed(1) : '--') + ' avg / ' + (wg != null ? wg.toFixed(1) : '--') + ' gust m/s';
-    var bf = beaufort(ws);
-    document.getElementById('beaufort').innerHTML = bf ? '<span class="beaufort">' + bf[1] + ' ' + bf[0] + '</span>' : '';
-
-    document.getElementById('icon-dew').textContent = dewIcon(dp);
-    document.getElementById('dew').innerHTML = (dp != null ? dp : '--') + '<span class="unit">°C</span>';
-    var dn = '';
-    if (dp != null && t != null) {
-      var spread = t - dp;
-      if (spread < 2) dn = 'Fog likely';
-      else if (spread < 5) dn = 'Comfortable';
-      else dn = 'Dry air';
-    }
-    document.getElementById('dew-note').textContent = dn;
-
-    document.getElementById('icon-rain').textContent = rainIcon(rain);
-    document.getElementById('rain').innerHTML = (rain != null ? rain.toFixed(1) : '--') + '<span class="unit"> mm</span>';
-    document.getElementById('rain-bar').style.width = Math.min(100, ((rain||0) / 20) * 100) + '%';
-    drawCompass(wd);
-    document.getElementById('station-id').textContent = d.station_id || '--';
-
-    // Status
-    var age = (Date.now() / 1000) - (new Date(d.time + 'Z').getTime() / 1000);
-    var dot = document.getElementById('status-dot');
-    document.getElementById('age').textContent = age < 120 ? 'live' : Math.round(age / 60) + 'm ago';
-    dot.className = age > 300 ? 'status-dot stale' : 'status-dot';
-    document.getElementById('status-text').textContent = age > 300 ? 'Stale' : 'Live';
-
-    // Today's min/max
-    try {
-      var sr = await fetch('/api/stats');
-      var s = await sr.json();
-      document.getElementById('range-temp').textContent = s.t_min != null ? '↓ ' + s.t_min + '°  ↑ ' + s.t_max + '°' : '';
-      document.getElementById('range-hum').textContent = s.h_min != null ? '↓ ' + s.h_min + '%  ↑ ' + s.h_max + '%' : '';
-      document.getElementById('range-wind').textContent = s.w_max != null ? 'Gust max ' + s.w_max.toFixed(1) + ' m/s' : '';
-    } catch(e) {}
-  } catch(e) {}
-
+  // ── History (incremental) ──────────────────
   try {
-    var hr = await fetch('/api/history?limit=288');
+    var url = lastId > 0 ? '/api/history?limit=288&since=' + lastId : '/api/history?limit=288';
+    var hr = await fetch(url);
     var rows = await hr.json();
     if (rows.length === 0) return;
-    drawChart('tempChart', rows, 'temperature_C', '°C', '#fb923c', '#fb923c');
-    drawChart('humChart', rows, 'humidity', '%', '#38bdf8', '#38bdf8');
-    drawChart('windChart', rows, 'wind_avg_m_s', 'm/s', '#4ade80', '#4ade80');
-    drawChart('rainChart', rows, 'rain_mm', 'mm', '#a78bfa', '#a78bfa');
+
+    // Track the highest id seen
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].id > lastId) lastId = rows[i].id;
+    }
+
+    if (lastId > 0 && rows.length > 0 && historyRows.length > 0) {
+      // Merge new rows, keeping up to 288
+      historyRows = historyRows.concat(rows);
+      if (historyRows.length > 288) historyRows = historyRows.slice(historyRows.length - 288);
+    } else {
+      historyRows = rows;
+    }
+
+    drawChart('tempChart', historyRows, 'temperature_C', '°C', '#fb923c', '#fb923c');
+    drawChart('humChart', historyRows, 'humidity', '%', '#38bdf8', '#38bdf8');
+    drawChart('windChart', historyRows, 'wind_avg_m_s', 'm/s', '#4ade80', '#4ade80');
+    drawChart('rainChart', historyRows, 'rain_mm', 'mm', '#a78bfa', '#a78bfa');
   } catch(e) {}
 }
 

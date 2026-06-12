@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Collect weather data from rtl_433 and store in SQLite."""
 import json
+import os
 import sqlite3
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 
-DB = "/home/oh2fxd/toolbox/python/wxstat/wxstat.db"
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxstat.db")
 
 RTL_CMD = [
     "rtl_433",
@@ -20,6 +21,7 @@ RTL_CMD = [
 
 
 def init_db(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -60,7 +60,7 @@ wxstat/
 |---|---|
 | `/` | Dashboard (HTML) |
 | `/api/current` | Latest reading as JSON |
-| `/api/history?limit=N` | Last N readings (default 288) |
+| `/api/history?limit=N&since=ID` | Last N readings, optionally since a given row id (incremental) |
 | `/api/stats` | Today's min/max |
 
 ## Frequency notes
@@ -80,5 +80,4 @@ a different frequency. Scan with: `rtl_433 -f 433.92M -s 250k -g 20`
 ## Next (planned)
 
 - MQTT bridge
-- Wind direction needle plot
 - Export to CSV

@@ -40,6 +40,13 @@ def init_db(conn):
     conn.commit()
 
 
+def to_ms(kmh):
+    """Convert km/h to m/s, returning None for None/missing."""
+    if kmh is None:
+        return None
+    return round(kmh / 3.6, 2)
+
+
 def insert(conn, data):
     conn.execute(
         """INSERT INTO readings
@@ -53,8 +60,8 @@ def insert(conn, data):
             data.get("temperature_C"),
             data.get("humidity"),
             data.get("wind_dir_deg"),
-            data.get("wind_avg_m_s"),
-            data.get("wind_max_m_s"),
+            to_ms(data.get("wind_avg_km_h")),
+            to_ms(data.get("wind_max_km_h")),
             data.get("rain_mm"),
             data.get("battery_ok"),
         ),

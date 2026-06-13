@@ -900,4 +900,4 @@ if __name__ == "__main__":
     print(f"[server] Dashboard  → http://{ip}:8080")
     print(f"[server] TCP push   → {ip}:{TCP_PORT}" if TCP_PORT else "[server] TCP push   → disabled")
 
-    app.run(host="127.0.0.1", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)

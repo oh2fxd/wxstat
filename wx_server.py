@@ -270,6 +270,18 @@ def dew_point(t, h):
     return round((b * gamma) / (a - gamma), 1)
 
 
+def _lan_ip():
+    """Detect the active LAN IP by attempting a UDP connect."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 @app.route("/api/current")
 def api_current():
     db = get_db()
@@ -316,7 +328,22 @@ def api_stats():
 
 @app.route("/")
 def dashboard():
-    return """<!DOCTYPE html>
+    hostname = socket.gethostname()
+    lan_ip = _lan_ip()
+    web_url = f"{lan_ip}:8080"
+    tcp_url = f"{lan_ip}:{TCP_PORT}" if TCP_PORT else "disabled"
+
+    return _DASHBOARD_HTML.replace("__HOSTNAME__", hostname) \
+                          .replace("__LAN_IP__", lan_ip) \
+                          .replace("__WEB_URL__", web_url) \
+                          .replace("__TCP_URL__", tcp_url)
+
+
+# ═══════════════════════════════════════════════════
+#  Dashboard template (cyberpunk theme)
+# ═══════════════════════════════════════════════════
+
+_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -324,74 +351,263 @@ def dashboard():
 <title>WX Station — 868.3 MHz</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Share+Tech+Mono&display=swap');
+
   :root {
-    --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
-    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
-    --temp: #fb923c; --hum: #38bdf8; --wind: #4ade80;
-    --rain: #a78bfa; --dew: #c084fc; --low: #f87171; --ok: #4ade80;
-    --radius: 16px;
+    --bg:       #0a0a0f;
+    --surface:  #0d1117;
+    --surface2: #161b22;
+    --border:   #1a1a2e;
+    --text:     #c0caf5;
+    --muted:    #565f89;
+    --cyan:     #00f0ff;
+    --magenta:  #ff00aa;
+    --green:    #00ff88;
+    --yellow:   #ffcc00;
+    --purple:   #bd93f9;
+    --red:      #ff3344;
+    --radius:   12px;
+    --font:     'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    --font-ui:  'Share Tech Mono', 'JetBrains Mono', monospace;
   }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
+
   body {
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
-    background: var(--bg); color: var(--text);
-    min-height: 100vh; padding: 24px;
+    font-family: var(--font-ui);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: clamp(16px, 3vw, 32px);
+    overflow-x: hidden;
+    /* subtle grid */
+    background-image:
+      linear-gradient(rgba(0,240,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    /* radial vignette */
+    background-attachment: fixed;
+    position: relative;
   }
-  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
-  .header h1 { font-size: 1.6em; font-weight: 700; background: linear-gradient(135deg, var(--accent), #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-  .header .meta { display: flex; gap: 16px; align-items: center; font-size: 0.85em; color: var(--muted); }
-  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
-  .status-dot.stale { background: var(--low); }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 28px; }
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(0,240,255,0.04) 0%, transparent 70%);
+    pointer-events: none; z-index: 0;
+  }
+
+  /* ── Header ───────────────────────────── */
+  .header {
+    position: relative; z-index: 1;
+    display: flex; align-items: flex-start; justify-content: space-between;
+    margin-bottom: clamp(16px, 2vw, 24px);
+    flex-wrap: wrap; gap: 12px;
+  }
+  .header-left h1 {
+    font-family: var(--font);
+    font-size: clamp(1.4em, 3vw, 2em); font-weight: 800;
+    color: var(--cyan);
+    text-shadow: 0 0 20px rgba(0,240,255,0.3), 0 0 60px rgba(0,240,255,0.1);
+    letter-spacing: -0.02em;
+  }
+  .header-left .freq {
+    font-family: var(--font); font-size: 0.75em; color: var(--muted);
+    margin-top: 2px;
+  }
+
+  /* status bar */
+  .status-bar {
+    position: relative; z-index: 1;
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--font); font-size: 0.78em; color: var(--muted);
+  }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green), 0 0 16px rgba(0,255,136,0.4);
+    display: inline-block;
+  }
+  .status-dot.stale { background: var(--red); box-shadow: 0 0 8px var(--red), 0 0 16px rgba(255,51,68,0.4); }
+  .status-bar .sep { color: var(--border); }
+
+  /* network info */
+  .net-info {
+    position: relative; z-index: 1;
+    display: flex; flex-wrap: wrap; gap: clamp(8px, 1.5vw, 16px);
+    margin-bottom: clamp(16px, 2vw, 24px);
+    font-family: var(--font); font-size: clamp(0.65em, 1.1vw, 0.75em);
+    color: var(--muted);
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .net-info .label { color: var(--cyan); }
+  .net-info .value { color: var(--text); font-weight: 600; }
+  .net-info .sep { color: var(--border); margin: 0 4px; }
+
+  /* ── Cards ────────────────────────────── */
+  .cards {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(clamp(180px, 20vw, 240px), 1fr));
+    gap: clamp(10px, 1.5vw, 16px);
+    margin-bottom: clamp(20px, 3vw, 28px);
+  }
   .card {
-    background: var(--surface); border-radius: var(--radius); padding: 18px 16px;
-    position: relative; overflow: hidden; border: 1px solid rgba(255,255,255,0.05);
-    transition: transform 0.2s, box-shadow 0.2s;
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: clamp(14px, 2vw, 20px) clamp(12px, 1.5vw, 16px);
+    border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+    transition: transform 0.2s, border-color 0.3s, box-shadow 0.3s;
   }
-  .card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.3); }
-  .card .icon { font-size: 1.6em; margin-bottom: 6px; }
-  .card .label { font-size: 0.75em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
-  .card .value { font-size: 2em; font-weight: 800; margin: 4px 0; }
-  .card .sub { font-size: 0.8em; color: var(--muted); }
-  .card .range { font-size: 0.7em; color: #64748b; margin-top: 6px; }
-  .card::after { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; border-radius: var(--radius) var(--radius) 0 0; }
-  .card.temp { --ac: var(--temp); }
-  .card.hum  { --ac: var(--hum); }
-  .card.wind { --ac: var(--wind); }
-  .card.rain { --ac: var(--rain); }
-  .card.dew  { --ac: var(--dew); }
-  .card.temp::after, .card.hum::after, .card.wind::after, .card.rain::after, .card.dew::after { background: var(--ac); }
-  .card .main-val { font-size: 2.4em; font-weight: 800; line-height: 1; }
-  .card .unit { font-size: 0.45em; font-weight: 500; }
-  .compass { width: 70px; height: 70px; margin: 4px auto; }
-  .compass svg { width: 100%; height: 100%; }
-  .rain-bar { height: 6px; background: var(--surface2); border-radius: 3px; margin-top: 8px; overflow: hidden; }
-  .rain-bar-fill { height: 100%; background: linear-gradient(90deg, var(--rain), #c084fc); border-radius: 3px; transition: width 0.5s; }
-  .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.75em; font-weight: 600; }
-  .badge.good { background: #065f46; color: #6ee7b7; }
-  .badge.warn { background: #713f12; color: #fcd34d; }
-  .badge.bad  { background: #7f1d1d; color: #fca5a5; }
-  .beaufort { display: inline-block; margin-left: 4px; font-weight: 600; }
-  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
-  .chart-box { background: var(--surface); border-radius: var(--radius); padding: 18px; border: 1px solid rgba(255,255,255,0.05); }
-  .chart-box h2 { font-size: 0.8em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; font-weight: 600; }
-  @media (max-width: 600px) {
-    body { padding: 12px; }
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  /* neon top accent */
+  .card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .card.temp::before { background: var(--magenta); box-shadow: 0 0 12px var(--magenta), 0 0 24px rgba(255,0,170,0.3); }
+  .card.hum::before  { background: var(--cyan);   box-shadow: 0 0 12px var(--cyan),   0 0 24px rgba(0,240,255,0.3); }
+  .card.wind::before { background: var(--green);  box-shadow: 0 0 12px var(--green),  0 0 24px rgba(0,255,136,0.3); }
+  .card.dew::before  { background: var(--purple); box-shadow: 0 0 12px var(--purple), 0 0 24px rgba(189,147,249,0.3); }
+  .card.rain::before { background: var(--yellow); box-shadow: 0 0 12px var(--yellow), 0 0 24px rgba(255,204,0,0.3); }
+  .card .icon { font-size: clamp(1.2em, 2vw, 1.6em); margin-bottom: 4px; }
+  .card .label {
+    font-family: var(--font);
+    font-size: clamp(0.6em, 0.9vw, 0.7em);
+    color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.1em;
+    margin-bottom: 4px;
+  }
+  .card .main-val {
+    font-family: var(--font);
+    font-size: clamp(2em, 3.5vw, 2.8em); font-weight: 800;
+    line-height: 1; margin: 4px 0;
+  }
+  .card .unit { font-size: 0.4em; font-weight: 400; opacity: 0.6; }
+  .card .sub {
+    font-family: var(--font);
+    font-size: clamp(0.65em, 0.9vw, 0.75em); color: var(--muted);
+    margin-top: 2px;
+  }
+  .card .range {
+    font-family: var(--font);
+    font-size: clamp(0.58em, 0.8vw, 0.65em); color: #3b4261;
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* card-specific text colors */
+  .card.temp .main-val { color: var(--magenta); text-shadow: 0 0 18px rgba(255,0,170,0.25); }
+  .card.hum  .main-val { color: var(--cyan);    text-shadow: 0 0 18px rgba(0,240,255,0.25); }
+  .card.wind .main-val { color: var(--green);   text-shadow: 0 0 18px rgba(0,255,136,0.25); }
+  .card.dew  .main-val { color: var(--purple);  text-shadow: 0 0 18px rgba(189,147,249,0.25); }
+  .card.rain .main-val { color: var(--yellow);  text-shadow: 0 0 18px rgba(255,204,0,0.25); }
+
+  /* ── Wind compass ──────────────────────── */
+  .compass { width: clamp(60px, 10vw, 80px); height: clamp(60px, 10vw, 80px); flex-shrink: 0; }
+
+  /* ── Badges ────────────────────────────── */
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-family: var(--font); font-size: 0.7em; font-weight: 600;
+    border: 1px solid;
+  }
+  .badge.good { background: rgba(0,255,136,0.1);  color: var(--green);  border-color: rgba(0,255,136,0.3); }
+  .badge.warn { background: rgba(255,204,0,0.1);  color: var(--yellow); border-color: rgba(255,204,0,0.3); }
+  .badge.bad  { background: rgba(255,51,68,0.1);  color: var(--red);    border-color: rgba(255,51,68,0.3); }
+
+  /* ── Rain bar ──────────────────────────── */
+  .rain-bar {
+    height: 5px; background: var(--surface2); border-radius: 3px;
+    margin-top: 10px; overflow: hidden;
+  }
+  .rain-bar-fill {
+    height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--yellow), var(--magenta));
+    box-shadow: 0 0 8px rgba(255,204,0,0.3);
+    transition: width 0.5s;
+  }
+
+  /* ── Charts ────────────────────────────── */
+  .charts {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(clamp(340px, 40vw, 500px), 1fr));
+    gap: clamp(10px, 1.5vw, 16px);
+  }
+  .chart-box {
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    padding: clamp(12px, 1.5vw, 16px);
+  }
+  .chart-box h2 {
+    font-family: var(--font);
+    font-size: clamp(0.65em, 0.85vw, 0.72em);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+  }
+
+  /* ── Scanline overlay ──────────────────── */
+  .scanlines {
+    position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.03) 2px,
+      rgba(0,0,0,0.03) 4px
+    );
+  }
+
+  /* ── Responsive ────────────────────────── */
+  @media (max-width: 700px) {
     .cards { grid-template-columns: repeat(2, 1fr); }
     .charts { grid-template-columns: 1fr; }
+    .net-info { font-size: 0.6em; }
+  }
+  @media (min-width: 1600px) {
+    body { padding: 36px 48px; }
+    .cards { grid-template-columns: repeat(5, 1fr); }
+    .charts { grid-template-columns: repeat(2, 1fr); }
   }
 </style>
 </head>
 <body>
+<div class="scanlines"></div>
 
 <div class="header">
-  <h1>Weather Station</h1>
-  <div class="meta">
+  <div class="header-left">
+    <h1>// WX_STATION</h1>
+    <div class="freq">868.300 MHz &nbsp;▸&nbsp; Fine Offset WHx080</div>
+  </div>
+  <div class="status-bar">
     <span id="status-dot" class="status-dot"></span>
     <span id="status-text">--</span>
-    <span>ID <strong id="station-id">--</strong></span>
-    <span id="age"></span>
+    <span class="sep">│</span>
+    <span>ID:<strong id="station-id">--</strong></span>
+    <span class="sep">│</span>
+    <span id="age">--</span>
   </div>
+</div>
+
+<div class="net-info">
+  <span class="label">[HOST]</span> <span class="value">__HOSTNAME__</span>
+  <span class="sep">│</span>
+  <span class="label">[IP]</span> <span class="value">__LAN_IP__</span>
+  <span class="sep">│</span>
+  <span class="label">[WEB]</span> <span class="value">__WEB_URL__</span>
+  <span class="sep">│</span>
+  <span class="label">[TCP]</span> <span class="value">__TCP_URL__</span>
 </div>
 
 <div class="cards">
@@ -415,7 +631,7 @@ def dashboard():
     <div style="display:flex;align-items:center;gap:10px;">
       <div class="compass" id="compass"></div>
       <div>
-        <div style="font-size:1.6em;font-weight:800;" id="wind-dir">--</div>
+        <div style="font-family:var(--font);font-size:clamp(1.2em,1.8vw,1.4em);font-weight:800;" id="wind-dir">--</div>
         <div class="sub" id="wind-speed">--</div>
         <div class="sub" id="beaufort"></div>
       </div>
@@ -431,16 +647,16 @@ def dashboard():
   <div class="card rain">
     <div class="icon" id="icon-rain"></div>
     <div class="label">Rain Total</div>
-    <div class="main-val" style="font-size:2.2em;" id="rain">--<span class="unit"> mm</span></div>
+    <div class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></div>
     <div class="rain-bar"><div class="rain-bar-fill" id="rain-bar" style="width:0%"></div></div>
   </div>
 </div>
 
 <div class="charts">
-  <div class="chart-box"><h2>Temperature · 24h</h2><canvas id="tempChart" height="100"></canvas></div>
-  <div class="chart-box"><h2>Humidity · 24h</h2><canvas id="humChart" height="100"></canvas></div>
-  <div class="chart-box"><h2>Wind Speed · 24h</h2><canvas id="windChart" height="100"></canvas></div>
-  <div class="chart-box"><h2>Rain Rate · 24h</h2><canvas id="rainChart" height="100"></canvas></div>
+  <div class="chart-box"><h2>▸ Temperature · 24h</h2><canvas id="tempChart" height="100"></canvas></div>
+  <div class="chart-box"><h2>▸ Humidity · 24h</h2><canvas id="humChart" height="100"></canvas></div>
+  <div class="chart-box"><h2>▸ Wind Speed · 24h</h2><canvas id="windChart" height="100"></canvas></div>
+  <div class="chart-box"><h2>▸ Rain · 24h</h2><canvas id="rainChart" height="100"></canvas></div>
 </div>
 
 <script>
@@ -506,39 +722,53 @@ function comfort(h) {
 function drawCompass(deg) {
   const c = document.getElementById('compass');
   c.innerHTML = '<svg viewBox="0 0 100 100">' +
-    '<circle cx="50" cy="50" r="46" fill="none" stroke="#334155" stroke-width="2"/>' +
-    '<circle cx="50" cy="50" r="38" fill="none" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,4"/>' +
-    '<line x1="50" y1="8" x2="50" y2="15" stroke="#64748b" stroke-width="1.5"/>' +
-    '<line x1="50" y1="85" x2="50" y2="92" stroke="#475569" stroke-width="1"/>' +
-    '<line x1="8" y1="50" x2="15" y2="50" stroke="#475569" stroke-width="1"/>' +
-    '<line x1="85" y1="50" x2="92" y2="50" stroke="#475569" stroke-width="1"/>' +
-    '<text x="50" y="12" text-anchor="middle" fill="#94a3b8" font-size="8">N</text>' +
-    '<polygon points="50,18 42,55 50,48 58,55" fill="#4ade80"' +
+    '<circle cx="50" cy="50" r="46" fill="none" stroke="#1a1a2e" stroke-width="2"/>' +
+    '<circle cx="50" cy="50" r="38" fill="none" stroke="#0d1117" stroke-width="1" stroke-dasharray="2,4"/>' +
+    '<line x1="50" y1="8" x2="50" y2="16" stroke="#565f89" stroke-width="1.5"/>' +
+    '<line x1="50" y1="84" x2="50" y2="92" stroke="#3b4261" stroke-width="1"/>' +
+    '<line x1="8" y1="50" x2="16" y2="50" stroke="#3b4261" stroke-width="1"/>' +
+    '<line x1="84" y1="50" x2="92" y2="50" stroke="#3b4261" stroke-width="1"/>' +
+    '<text x="50" y="12" text-anchor="middle" fill="#00f0ff" font-size="8" font-family="monospace">N</text>' +
+    '<polygon points="50,18 42,55 50,48 58,55" fill="#00ff88"' +
+    ' filter="drop-shadow(0 0 3px #00ff88)"' +
     ' transform="rotate(' + (deg||0) + ',50,50)" style="transition:transform 0.6s"/>' +
     '</svg>';
 }
 
-// ── Charts ───────────────────────────────────
-function drawChart(canvasId, rows, key, label, color, fromColor) {
+// ── Charts (cyberpunk palette) ─────────────
+const C = { magenta:'#ff00aa', cyan:'#00f0ff', green:'#00ff88', purple:'#bd93f9' };
+
+function drawChart(canvasId, rows, key, color, fromColor) {
   const ctx = document.getElementById(canvasId).getContext('2d');
   const labels = rows.map(r => r.time.slice(11,16));
   const data = rows.map(r => r[key]);
   const key2 = canvasId + '_chart';
   if (window[key2]) window[key2].destroy();
   var grad = ctx.createLinearGradient(0, 0, 0, 110);
-  grad.addColorStop(0, fromColor + '60');
+  grad.addColorStop(0, fromColor + '50');
   grad.addColorStop(1, fromColor + '05');
   window[key2] = new Chart(ctx, {
     type: 'line',
-    data: { labels, datasets: [{ label, data, borderColor: color, backgroundColor: grad, borderWidth: 2, pointRadius: 0, tension: 0.35, fill: true }] },
+    data: { labels, datasets: [{ data, borderColor: color, backgroundColor: grad, borderWidth: 2, pointRadius: 0,
+      tension: 0.35, fill: true }] },
     options: {
-      responsive: true, animation: { duration: 300 },
+      responsive: true, animation: { duration: 400 },
       interaction: { intersect: false, mode: 'index' },
       scales: {
-        x: { ticks: { color: '#64748b', maxTicksLimit: 10, font: { size: 10 } }, grid: { color: '#1e293b' } },
-        y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e293b' } }
+        x: { ticks: { color: '#3b4261', maxTicksLimit: 10, font: { size: 10, family: 'monospace' } },
+             grid: { color: '#1a1a2e' } },
+        y: { ticks: { color: '#3b4261', font: { size: 10, family: 'monospace' } },
+             grid: { color: '#1a1a2e' } }
       },
-      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } }
+      plugins: { legend: { display: false },
+        tooltip: {
+          mode: 'index', intersect: false,
+          backgroundColor: '#0d1117',
+          borderColor: color, borderWidth: 1,
+          titleColor: '#c0caf5', bodyColor: '#c0caf5',
+          titleFont: { family: 'monospace' }, bodyFont: { family: 'monospace' }
+        }
+      }
     }
   });
 }
@@ -564,7 +794,6 @@ async function refresh() {
       var rain = d.rain_mm;
       var dp = d.dew_point_C;
 
-      // Cards
       document.getElementById('icon-temp').textContent = tempIcon(t);
       document.getElementById('temp').innerHTML = (t != null ? t : '--') + '<span class="unit">°C</span>';
       var fl = '';
@@ -581,7 +810,7 @@ async function refresh() {
       document.getElementById('wind-dir').textContent = windDirStr(wd);
       document.getElementById('wind-speed').textContent = (ws != null ? ws.toFixed(1) : '--') + ' avg / ' + (wg != null ? wg.toFixed(1) : '--') + ' gust m/s';
       var bf = beaufort(ws);
-      document.getElementById('beaufort').innerHTML = bf ? '<span class="beaufort">' + bf[1] + ' ' + bf[0] + '</span>' : '';
+      document.getElementById('beaufort').innerHTML = bf ? bf[1] + ' ' + bf[0] : '';
 
       document.getElementById('icon-dew').textContent = dewIcon(dp);
       document.getElementById('dew').innerHTML = (dp != null ? dp : '--') + '<span class="unit">°C</span>';
@@ -600,14 +829,12 @@ async function refresh() {
       drawCompass(wd);
       document.getElementById('station-id').textContent = d.station_id || '--';
 
-      // Status
       var age = (Date.now() / 1000) - (new Date(d.time + 'Z').getTime() / 1000);
       var dot = document.getElementById('status-dot');
       document.getElementById('age').textContent = age < 120 ? 'live' : Math.round(age / 60) + 'm ago';
       dot.className = age > 300 ? 'status-dot stale' : 'status-dot';
       document.getElementById('status-text').textContent = age > 300 ? 'Stale' : 'Live';
 
-      // Today's min/max
       try {
         var sr = await fetch('/api/stats');
         var s = await sr.json();
@@ -618,16 +845,13 @@ async function refresh() {
     }
   } catch(e) { failCount++; }
 
-  // ── Connection status ──────────────────────
-  if (ok) {
-    failCount = 0;
-  } else if (failCount >= 2) {
+  if (ok) { failCount = 0; }
+  else if (failCount >= 2) {
     document.getElementById('status-dot').className = 'status-dot stale';
     document.getElementById('status-text').textContent = 'Offline';
     document.getElementById('age').textContent = '—';
   }
 
-  // ── History (incremental) ──────────────────
   try {
     var url = lastId > 0 ? '/api/history?limit=288&since=' + lastId : '/api/history?limit=288';
     var hr = await fetch(url);
@@ -645,10 +869,10 @@ async function refresh() {
       historyRows = rows;
     }
 
-    drawChart('tempChart', historyRows, 'temperature_C', '°C', '#fb923c', '#fb923c');
-    drawChart('humChart', historyRows, 'humidity', '%', '#38bdf8', '#38bdf8');
-    drawChart('windChart', historyRows, 'wind_avg_m_s', 'm/s', '#4ade80', '#4ade80');
-    drawChart('rainChart', historyRows, 'rain_mm', 'mm', '#a78bfa', '#a78bfa');
+    drawChart('tempChart', historyRows, 'temperature_C', C.magenta, C.magenta);
+    drawChart('humChart',  historyRows, 'humidity',       C.cyan,    C.cyan);
+    drawChart('windChart', historyRows, 'wind_avg_m_s',    C.green,   C.green);
+    drawChart('rainChart', historyRows, 'rain_mm',         C.purple,  C.purple);
   } catch(e) {}
 }
 

@@ -34,21 +34,22 @@ cd wxstat
 ./start.sh
 ```
 
-Opens `http://localhost:8080`. The collector waits for sensor bursts
-(typically every 48–60 seconds) and starts showing data automatically.
+Opens `http://localhost:8080`. The collector starts automatically as a
+background thread — it waits for sensor bursts (typically every 48–60
+seconds) and shows data as soon as they arrive.
 
-### Manual start
+TCP push for ESP32 is on by default at port **8081**.
+
+### Direct start
 ```bash
-TCP_PORT=8081 python3 wx_collector.py &    # background: captures, stores, TCP push
-python3 wx_server.py                        # foreground: web dashboard
+python3 wx_server.py    # collector + dashboard + TCP push
 ```
 
 ## Project structure
 
 ```
 wxstat/
-├── wx_collector.py   # rtl_433 → SQLite + optional TCP push
-├── wx_server.py      # Flask web dashboard + JSON API
+├── wx_server.py      # rtl_433 collector + SQLite + Flask dashboard + TCP push
 ├── start.sh          # One-command launcher (Linux + macOS)
 ├── push.sh           # git commit + push helper
 └── wxstat.db         # SQLite database (auto-created)
@@ -66,22 +67,15 @@ wxstat/
 ## Frequency notes
 
 The sensor was found at **868.3 MHz**. If yours is different, edit
-`RTL_CMD` in `wx_collector.py`. Common alternatives: 433.92, 915 MHz.
+`RTL_CMD` in `wx_server.py`. Common alternatives: 433.92, 915 MHz.
 
 ## TCP push (ESP32)
 
-The collector can push readings over raw TCP — no broker, no libraries needed.
-ESP32 just opens a socket and reads newline-delimited JSON lines.
+The server pushes readings over raw TCP on port **8081** by default —
+no broker, no libraries needed. ESP32 just opens a socket and reads
+newline-delimited JSON lines.
 
-### Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `TCP_PORT` | `0` (disabled) | Port to listen on for TCP clients |
-
-```bash
-TCP_PORT=8081 python3 wx_collector.py &
-```
+Disable with `TCP_PORT=0 python3 wx_server.py`.
 
 ### Protocol
 Each reading is a single JSON line followed by `\n`. Clients connect, read, and

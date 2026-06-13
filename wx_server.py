@@ -1,12 +1,251 @@
 #!/usr/bin/env python3
-"""Flask web dashboard for weather station data."""
+"""Weather station — rtl_433 collector + SQLite + Flask dashboard + TCP push.
+
+Run:
+    ./start.sh           # one-command launcher
+    python3 wx_server.py # direct start (collector + dashboard)
+"""
+import json
 import os
+import select
+import socket
 import sqlite3
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+
+import flask
 from flask import Flask, g, jsonify, request
 
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxstat.db")
 app = Flask(__name__)
 
+RTL_CMD = [
+    "rtl_433",
+    "-Y", "classic",
+    "-f", "868.3M",
+    "-s", "250k",
+    "-g", "20",
+    "-F", "json",
+]
+
+TCP_PORT = int(os.environ.get("TCP_PORT", 8081))
+
+
+# ═══════════════════════════════════════════════════
+#  Database
+# ═══════════════════════════════════════════════════
+
+def init_db(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT NOT NULL,
+            model TEXT,
+            station_id INTEGER,
+            temperature_C REAL,
+            humidity INTEGER,
+            wind_dir_deg INTEGER,
+            wind_avg_m_s REAL,
+            wind_max_m_s REAL,
+            rain_mm REAL,
+            battery_ok INTEGER
+        )
+    """)
+    conn.commit()
+
+
+def to_ms(kmh):
+    """Convert km/h to m/s, returning None for None/missing."""
+    if kmh is None:
+        return None
+    return round(kmh / 3.6, 2)
+
+
+def insert(conn, data):
+    conn.execute(
+        """INSERT INTO readings
+           (time, model, station_id, temperature_C, humidity,
+            wind_dir_deg, wind_avg_m_s, wind_max_m_s, rain_mm, battery_ok)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            data.get("time", datetime.now(timezone.utc).isoformat()),
+            data.get("model"),
+            data.get("id"),
+            data.get("temperature_C"),
+            data.get("humidity"),
+            data.get("wind_dir_deg"),
+            to_ms(data.get("wind_avg_km_h")),
+            to_ms(data.get("wind_max_km_h")),
+            data.get("rain_mm"),
+            data.get("battery_ok"),
+        ),
+    )
+    conn.commit()
+
+
+# ═══════════════════════════════════════════════════
+#  TCP push server (ESP32 direct connection)
+# ═══════════════════════════════════════════════════
+
+class TCPPushServer:
+    """Listens on a TCP port and pushes JSON readings to connected clients.
+
+    Each reading is sent as a newline-delimited JSON object.
+    Clients just open a raw TCP socket and read lines."""
+
+    def __init__(self, port):
+        self.port = port
+        self.clients = []
+        self._lock = threading.Lock()
+        self._running = True
+
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("0.0.0.0", port))
+        self._server.listen(5)
+        self._server.setblocking(False)
+
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop, daemon=True
+        )
+        self._accept_thread.start()
+        print(f"[tcp-push] listening on port {port}")
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                readable, _, _ = select.select([self._server], [], [], 1.0)
+                if readable:
+                    sock, addr = self._server.accept()
+                    sock.setblocking(False)
+                    with self._lock:
+                        self.clients.append(sock)
+                    n = len(self.clients)
+                    print(f"[tcp-push] client {addr[0]}:{addr[1]} ({n} connected)")
+            except Exception:
+                pass
+
+    def broadcast(self, line):
+        """Send a line to all clients, pruning disconnected ones."""
+        with self._lock:
+            alive = []
+            for sock in self.clients:
+                try:
+                    sock.sendall(line)
+                    alive.append(sock)
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            self.clients = alive
+
+    def stop(self):
+        self._running = False
+        with self._lock:
+            for sock in self.clients:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self.clients = []
+        try:
+            self._server.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════
+#  rtl_433 collector (daemon thread)
+# ═══════════════════════════════════════════════════
+
+def _drain_stderr(pipe, prefix, lines_out):
+    """Read stderr lines into a list for later printing (daemon thread)."""
+    for line in pipe:
+        line = line.strip()
+        if line:
+            lines_out.append(f"[{prefix}] {line}")
+
+
+def _run_rtl433(conn, tcp):
+    """Run rtl_433 subprocess, feeding parsed readings into the database."""
+    proc = subprocess.Popen(
+        RTL_CMD, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    stderr_lines = []
+    stderr_thread = threading.Thread(
+        target=_drain_stderr,
+        args=(proc.stderr, "rtl_433", stderr_lines),
+        daemon=True,
+    )
+    stderr_thread.start()
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("model") != "Fineoffset-WHx080":
+                continue
+
+            insert(conn, msg)
+            temp = msg.get("temperature_C", "?")
+            hum = msg.get("humidity", "?")
+            ts = msg.get("time", "?")
+            print(f"[collector] {ts}  temp={temp}°C  hum={hum}%")
+
+            if tcp:
+                tcp.broadcast((json.dumps(msg) + "\n").encode())
+    except Exception as e:
+        print(f"[collector] Error: {e}")
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        stderr_thread.join(timeout=2)
+        for l in stderr_lines:
+            print(l, flush=True)
+
+
+def _rtl433_loop():
+    """Daemon thread: keep rtl_433 running, restarting on failure."""
+    conn = sqlite3.connect(DB)
+    init_db(conn)
+    print(f"[collector] DB ready: {DB}")
+
+    tcp = None
+    if TCP_PORT:
+        try:
+            tcp = TCPPushServer(TCP_PORT)
+        except Exception as e:
+            print(f"[tcp-push] failed to start ({e}) — continuing without")
+    else:
+        print("[tcp-push] disabled (set TCP_PORT to enable)")
+
+    try:
+        while True:
+            print("[collector] Starting rtl_433...")
+            _run_rtl433(conn, tcp)
+            print("[collector] rtl_433 exited, restarting in 10s...")
+            time.sleep(10)
+    finally:
+        if tcp:
+            tcp.stop()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════
+#  Flask web routes
+# ═══════════════════════════════════════════════════
 
 def get_db():
     if "db" not in g:
@@ -16,7 +255,7 @@ def get_db():
 
 
 @app.teardown_appcontext
-def close_db(_):
+def _close_db(_):
     db = g.pop("db", None)
     if db:
         db.close()
@@ -70,7 +309,7 @@ def api_stats():
                MIN(humidity) as h_min, MAX(humidity) as h_max,
                MAX(wind_max_m_s) as w_max
         FROM readings
-        WHERE time >= date('now')  -- UTC, matches collector's datetime.now(timezone.utc)
+        WHERE time >= date('now')  -- UTC, matches collector datetimes
     """).fetchone()
     return jsonify(dict(rows)) if rows else jsonify({})
 
@@ -215,7 +454,6 @@ function windDirStr(d) {
   return WA[i] + ' ' + WL[i] + ' ' + d + '°';
 }
 
-// Beaufort scale from m/s
 function beaufort(ms) {
   if (ms == null) return '';
   if (ms < 0.5) return ['Calm','😌'];
@@ -396,13 +634,11 @@ async function refresh() {
     var rows = await hr.json();
     if (rows.length === 0) return;
 
-    // Track the highest id seen
     for (var i = 0; i < rows.length; i++) {
       if (rows[i].id > lastId) lastId = rows[i].id;
     }
 
     if (lastId > 0 && rows.length > 0 && historyRows.length > 0) {
-      // Merge new rows, keeping up to 288
       historyRows = historyRows.concat(rows);
       if (historyRows.length > 288) historyRows = historyRows.slice(historyRows.length - 288);
     } else {
@@ -423,5 +659,17 @@ setInterval(refresh, 60000);
 </html>"""
 
 
+# ═══════════════════════════════════════════════════
+#  Startup
+# ═══════════════════════════════════════════════════
+
 if __name__ == "__main__":
+    # Init DB schema + WAL before starting anything
+    conn = sqlite3.connect(DB)
+    init_db(conn)
+    conn.close()
+
+    # Start collector in background daemon thread
+    threading.Thread(target=_rtl433_loop, daemon=True).start()
+
     app.run(host="127.0.0.1", port=8080, debug=False)

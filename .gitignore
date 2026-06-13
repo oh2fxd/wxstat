@@ -1,4 +1,6 @@
 *.db
+*.db-shm
+*.db-wal
 *.iq
 *.csv
 *.json
@@ -10,3 +12,4 @@ venv/
 check.py
 download.ashx*
 push.sh
+_apply_fixes.py

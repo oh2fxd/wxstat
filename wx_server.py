@@ -896,4 +896,8 @@ if __name__ == "__main__":
     # Start collector in background daemon thread
     threading.Thread(target=_rtl433_loop, daemon=True).start()
 
+    ip = _lan_ip()
+    print(f"[server] Dashboard  → http://{ip}:8080")
+    print(f"[server] TCP push   → {ip}:{TCP_PORT}" if TCP_PORT else "[server] TCP push   → disabled")
+
     app.run(host="127.0.0.1", port=8080, debug=False)

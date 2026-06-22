@@ -32,7 +32,7 @@ fi
 python3 -c "import flask" 2>/dev/null || pip3 install flask
 
 # ── Start server (collector + dashboard) ───────
-echo "[start] → http://localhost:8080"
+echo "[start] → http://localhost:${HTTP_PORT:-8085}"
 python3 wx_server.py
 
 # ── Cleanup ───────────────────────────────────

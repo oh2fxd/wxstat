@@ -39,7 +39,7 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", 8085))
 # Ollama — local LLM weather analysis (enabled by default)
 OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() in ("1", "true", "yes")
 OLLAMA_URL     = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
 OLLAMA_CACHE_S = int(os.environ.get("OLLAMA_CACHE_S", 300))
 
 

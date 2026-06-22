@@ -1,96 +1,147 @@
 # WX Station
 
-Minimal weather station dashboard for Fine Offset WHx080 / WH1080 sensors decoded
-with [rtl_433](https://github.com/merbanan/rtl_433) on 868.3 MHz.
+Minimal weather station for Fine Offset WHx080 / WH1080 sensors decoded with
+[rtl_433](https://github.com/merbanan/rtl_433) on 868.3 MHz.
+
+**Single process** — collector, SQLite storage, Flask dashboard, TCP push, and
+optional LLM weather analysis all run inside `wx_server.py`.
 
 ![screenshot](screenshot.png)
 
-## Hardware
+## Features
 
-- **RTL-SDR** stick (RTL2832U)
-- **Weather sensor**: Fine Offset WHx080 (sold under many brands), transmits OOK PWM at 868.3 MHz
-- Antenna cut to **17.3 cm** (quarter-wave for 868 MHz)
+- Cyberpunk-themed web dashboard with live charts (Chart.js)
+- TCP push for ESP32 / embedded displays (newline-delimited JSON)
+- **Ollama-powered weather analysis** — describes current conditions with
+  emoji and a one-liner
+- Rule-based fallback when Ollama is unavailable (always works, zero delay)
+- Incremental history API for efficient polling
+- Linux & macOS support
 
-## Install
+---
 
-### Linux (Debian/Ubuntu)
+## Quick Start
+
+### 1. Install dependencies
+
+**Linux (Debian/Ubuntu):**
 ```bash
-sudo apt install rtl-433 python3-flask sqlite3
-git clone <this-repo>
-cd wxstat
+sudo apt install rtl-433 python3-flask
 ```
 
-### macOS
+**macOS:**
 ```bash
 brew install rtl_433 librtlsdr
 pip3 install flask
-git clone <this-repo>
-cd wxstat
 ```
 
-## Usage
+### 2. Clone & run
 
 ```bash
+git clone https://github.com/<you>/wxstat.git
+cd wxstat
 ./start.sh
 ```
 
-Opens `http://localhost:8080`. The collector starts automatically as a
-background thread — it waits for sensor bursts (typically every 48–60
-seconds) and shows data as soon as they arrive.
+First launch output:
+```
+=== WX Station (Darwin) ===
+[start] → http://localhost:8085
+[server] Dashboard  → http://192.168.1.130:8085
+[server] TCP push   → 192.168.1.130:8081
+[collector] DB ready: wxstat.db
+[tcp-push] listening on port 8081
+[ollama] warming up model 'qwen2.5:0.5b' ...
+[ollama] Rainy — Cool with very high humidity.
+[collector] 2026-06-22 19:40:39  temp=10.1°C  hum=99%  [Rainy]
+```
 
-TCP push for ESP32 is on by default at port **8081**.
+Open **http://localhost:8085** for the dashboard.
 
-### Direct start
+---
+
+## Ollama Weather Analysis
+
+When Ollama is running locally, each reading is sent to a tiny model
+(~500 MB) that classifies weather conditions and writes a one-sentence
+description. The result is attached to the TCP broadcast so your ESP32
+can display the right icon.
+
+### Setup
+
 ```bash
-python3 wx_server.py    # collector + dashboard + TCP push
+# Mac / Linux: install & start Ollama
+brew install ollama                # macOS
+# or: curl -fsSL https://ollama.com/install.sh | sh   # Linux
+
+# Pull the default model (~400 MB)
+ollama pull qwen2.5:0.5b
+
+# Start the server (usually already running as a daemon)
+ollama serve
 ```
 
-## Project structure
+**That's it.** `wx_server.py` detects Ollama on `localhost:11434` and
+uses it automatically.
 
+### Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `OLLAMA_ENABLED` | `true` | Set to `false` to disable (rule-based fallback only) |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Which model to use |
+| `OLLAMA_CACHE_S` | `300` | Seconds between LLM calls (no point calling every ~60s) |
+
+Example — use a different model:
+```bash
+OLLAMA_MODEL=llama3.1:8b ./start.sh
 ```
-wxstat/
-├── wx_server.py      # rtl_433 collector + SQLite + Flask dashboard + TCP push
-├── start.sh          # One-command launcher (Linux + macOS)
-├── push.sh           # git commit + push helper
-└── wxstat.db         # SQLite database (auto-created)
-```
 
-## API
+### How it works
 
-| Endpoint | Description |
-|---|---|
-| `/` | Dashboard (HTML) |
-| `/api/current` | Latest reading as JSON |
-| `/api/history?limit=N&since=ID` | Last N readings, optionally since a given row id (incremental) |
-| `/api/stats` | Today's min/max |
+- First reading after startup: warms up the model (first inference may take 5–30s)
+- Subsequent readings: cached for 5 minutes, sub-second response
+- If Ollama is unreachable: rule-based fallback produces the same fields instantly
+- Never blocks readings — analysis failure is silent
 
-## Frequency notes
+---
 
-The sensor was found at **868.3 MHz**. If yours is different, edit
-`RTL_CMD` in `wx_server.py`. Common alternatives: 433.92, 915 MHz.
+## TCP Push (ESP32)
 
-## TCP push (ESP32)
+Raw TCP on port **8081** — no broker, no MQTT, no libraries. The ESP32 opens a
+socket and reads newline-delimited JSON. Each sensor burst (~every 60s) produces
+one line.
 
-The server pushes readings over raw TCP on port **8081** by default —
-no broker, no libraries needed. ESP32 just opens a socket and reads
-newline-delimited JSON lines.
-
-Disable with `TCP_PORT=0 python3 wx_server.py`.
-
-### Protocol
-Each reading is a single JSON line followed by `\n`. Clients connect, read, and
-receive a new line each time the sensor transmits (every ~60s). The format
-matches what `rtl_433` emits:
+### Message format
 
 ```json
-{"time":"2026-06-12 19:36:52","model":"Fineoffset-WHx080","id":238,"temperature_C":16.5,"humidity":58,"wind_dir_deg":225,"wind_avg_km_h":0.0,"wind_max_km_h":1.224,"rain_mm":4.2,"battery_ok":1}
+{
+  "time": "2026-06-22 18:57:27",
+  "model": "Fineoffset-WHx080",
+  "id": 238,
+  "temperature_C": 10.0,
+  "humidity": 99,
+  "wind_dir_deg": 45,
+  "wind_avg_km_h": 0.0,
+  "wind_max_km_h": 0.0,
+  "rain_mm": 4.8,
+  "battery_ok": 1,
+  "condition": "Rainy",
+  "icon": "🌧️",
+  "description": "Cool with very high humidity and recent rain."
+}
 ```
 
+The last three fields (`condition`, `icon`, `description`) come from
+Ollama or the rule-based fallback.
+
 ### ESP32 example (Arduino)
+
 ```cpp
 #include <WiFi.h>
 
-const char* WX_HOST = "192.168.1.10";
+const char* WX_HOST = "192.168.1.130";
 const uint16_t WX_PORT = 8081;
 
 WiFiClient client;
@@ -110,21 +161,92 @@ void loop() {
   }
   while (client.available()) {
     String line = client.readStringUntil('\n');
-    Serial.println(line);  // parse JSON here
+    // Parse JSON, read "icon" or "condition", draw on display
+    Serial.println(line);
   }
 }
 ```
 
 ### Test from a terminal
+
 ```bash
-nc <pi-ip> 8081       # prints a new JSON line every ~60s
+nc <host-ip> 8081           # prints a JSON line each time the sensor transmits
 ```
+
+### Disable TCP push
+
+```bash
+TCP_PORT=0 ./start.sh
+```
+
+---
+
+## API
+
+| Endpoint | Description |
+|---|---|
+| `/` | Cyberpunk HTML dashboard |
+| `/api/current` | Latest reading as JSON (includes `dew_point_C`) |
+| `/api/history?limit=N&since=ID` | Last N readings, optionally since a row id |
+| `/api/stats` | Today's min/max for temperature, humidity, wind |
+
+---
+
+## Project Structure
+
+```
+wxstat/
+├── wx_server.py      # Collector + SQLite + Flask + TCP push + Ollama analysis
+├── start.sh          # One-command launcher (Linux + macOS)
+├── push.sh           # git add -A + commit + push helper
+├── LICENSE           # MIT
+├── README.md
+└── wxstat.db         # SQLite database (auto-created on first run)
+```
+
+---
+
+## Configuration Reference
+
+All settings via environment variables:
+
+| Env var | Default | Description |
+|---|---|---|
+| `HTTP_PORT` | `8085` | Flask dashboard port |
+| `TCP_PORT` | `8081` | TCP push port (0 to disable) |
+| `OLLAMA_ENABLED` | `true` | Enable Ollama analysis |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama API |
+| `OLLAMA_MODEL` | `qwen2.5:0.5b` | Ollama model name |
+| `OLLAMA_CACHE_S` | `300` | Seconds between LLM calls |
+
+Frequency and gain are hardcoded in `RTL_CMD` (line 27 of `wx_server.py`).
+Edit if your sensor uses a different frequency (common: 433.92, 915 MHz).
+
+---
 
 ## Troubleshooting
 
-**`usb_claim_interface error -6`** — kernel drivers grabbed the SDR.
-`start.sh` handles this on Linux. If it persists, unplug/replug the stick
-or run: `sudo rmmod dvb_usb_rtl28xxu`
+**`[ollama] failed (HTTP Error 404: Not Found)`**
+→ `ollama pull qwen2.5:0.5b` — the default model isn't downloaded yet.
 
-**No data after 5 minutes** — sensor batteries may be dead, or it's on
-a different frequency. Scan with: `rtl_433 -f 433.92M -s 250k -g 20`
+**`[ollama] failed (Connection refused)`**
+→ Ollama isn't running. Start it with `ollama serve` or launch the Mac app.
+
+**`[ollama] failed (timed out)`**
+→ The model is loading into GPU. The warm-up handles this on startup,
+but very large models may take longer than 60s. Use a smaller model or
+bump the timeout in `wx_server.py`.
+
+**`usb_claim_interface error -6`** (Linux)
+→ `start.sh` handles kernel module conflicts. If it persists, unplug/replug
+the SDR stick or run: `sudo rmmod dvb_usb_rtl28xxu`
+
+**No data after 5 minutes**
+→ Sensor batteries dead, out of range, or wrong frequency. Scan with:
+`rtl_433 -f 433.92M -s 250k -g 20`
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)

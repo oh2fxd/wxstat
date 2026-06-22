@@ -7,12 +7,15 @@ Run:
 """
 import json
 import os
+import re
 import select
 import socket
 import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 import flask
@@ -30,7 +33,14 @@ RTL_CMD = [
     "-F", "json",
 ]
 
-TCP_PORT = int(os.environ.get("TCP_PORT", 8081))
+TCP_PORT  = int(os.environ.get("TCP_PORT", 8081))
+HTTP_PORT = int(os.environ.get("HTTP_PORT", 8085))
+
+# Ollama — local LLM weather analysis (enabled by default)
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() in ("1", "true", "yes")
+OLLAMA_URL     = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
+OLLAMA_CACHE_S = int(os.environ.get("OLLAMA_CACHE_S", 300))
 
 
 # ═══════════════════════════════════════════════════
@@ -159,6 +169,182 @@ class TCPPushServer:
 
 
 # ═══════════════════════════════════════════════════
+#  Weather condition analysis (Ollama + rule-based fallback)
+# ═══════════════════════════════════════════════════
+
+_condition_cache = {"ts": 0, "result": None}
+_condition_lock = threading.Lock()
+
+
+def _simple_condition(data):
+    """Rule-based weather condition — always available, runs instantly."""
+    temp = data.get("temperature_C")
+    hum = data.get("humidity")
+    wind = data.get("wind_avg_km_h", 0)
+    wind_gust = data.get("wind_max_km_h", 0)
+    rain = data.get("rain_mm", 0)
+    wind_dir = data.get("wind_dir_deg")
+
+    # Rain takes priority
+    if rain is not None and rain > 0:
+        if wind_gust is not None and wind_gust > 30:
+            return {"condition": "Stormy", "icon": "⛈️",
+                    "description": f"Heavy rain with strong gusts {wind_gust} km/h, {temp}°C."}
+        if wind is not None and wind > 15:
+            return {"condition": "Rainy & Windy", "icon": "🌧️",
+                    "description": f"Rain at {temp}°C with brisk wind {wind} km/h."}
+        if temp is not None and temp < 2:
+            return {"condition": "Sleet", "icon": "🌨️",
+                    "description": f"Near-freezing rain, {temp}°C."}
+        return {"condition": "Rainy", "icon": "🌧️",
+                "description": f"Rain, {temp}°C with {hum}% humidity."}
+
+    # Wind
+    if wind_gust is not None and wind_gust > 40:
+        return {"condition": "Windy", "icon": "💨",
+                "description": f"Strong wind gusting {wind_gust} km/h from {wind_dir}°, {temp}°C."}
+    if wind_gust is not None and wind_gust > 25:
+        return {"condition": "Windy", "icon": "🌬️",
+                "description": f"Fresh breeze {wind_gust} km/h, {temp}°C."}
+    if wind is not None and wind > 12:
+        return {"condition": "Breezy", "icon": "🍃",
+                "description": f"Light breeze {wind} km/h, {temp}°C."}
+
+    # Fog / overcast / clear by humidity
+    if hum is not None and hum >= 95:
+        if temp is not None and temp <= 10:
+            return {"condition": "Foggy", "icon": "🌫️",
+                    "description": f"High humidity with cool air, fog likely, {temp}°C."}
+        return {"condition": "Overcast", "icon": "☁️",
+                "description": f"Very humid {hum}%, overcast, {temp}°C."}
+    if hum is not None and hum > 80:
+        return {"condition": "Overcast", "icon": "☁️",
+                "description": f"Mostly cloudy, {hum}% humidity, {temp}°C."}
+
+    # Clear conditions
+    if temp is not None and temp > 28:
+        return {"condition": "Clear", "icon": "☀️",
+                "description": f"Hot and sunny, {temp}°C."}
+    if temp is not None and temp > 22:
+        return {"condition": "Clear", "icon": "🌤️",
+                "description": f"Warm and pleasant, {temp}°C."}
+    if hum is not None and hum < 35:
+        return {"condition": "Clear", "icon": "🌤️",
+                "description": f"Dry and clear, {temp}°C."}
+
+    # Default
+    return {"condition": "Partly Cloudy", "icon": "⛅",
+            "description": f"Mild conditions, {temp}°C with {hum}% humidity."}
+
+
+def analyze_weather(data):
+    """Call local Ollama to interpret weather — cached for OLLAMA_CACHE_S seconds."""
+    global _condition_cache
+
+    now = time.time()
+    with _condition_lock:
+        if _condition_cache["result"] and (now - _condition_cache["ts"]) < OLLAMA_CACHE_S:
+            return _condition_cache["result"]
+
+    temp = data.get("temperature_C", "?")
+    hum = data.get("humidity", "?")
+    wind = data.get("wind_avg_km_h", "?")
+    gust = data.get("wind_max_km_h", "?")
+    wdir = data.get("wind_dir_deg", "?")
+    rain = data.get("rain_mm", "?")
+
+    prompt = (
+        "You are a weather analyst. Return ONLY a JSON object, nothing else. No markdown, no explanation.\n\n"
+        f"Weather data: temperature={temp}°C, humidity={hum}%, wind_avg={wind} km/h, "
+        f"wind_gust={gust} km/h, wind_dir={wdir}°, rain={rain} mm\n\n"
+        'Return exactly: {"condition": "<short label>", "icon": "<one emoji>", "description": "<one sentence>"}\n'
+        'Conditions: Clear, Partly Cloudy, Overcast, Rainy, Stormy, Windy, Breezy, Foggy, Sleet, Snow'
+    )
+
+    try:
+        body = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+        raw = result.get("response", "").strip()
+
+        # Try to extract JSON — model may wrap it in markdown or text
+        parsed = None
+        # 1) Direct parse
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        # 2) Strip ``` fences then parse
+        if parsed is None:
+            stripped = raw
+            if stripped.startswith("```"):
+                stripped = stripped.split("\n", 1)[-1]
+                if stripped.endswith("```"):
+                    stripped = stripped[:-3]
+                stripped = stripped.strip()
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                pass
+        # 3) Regex hunt for { ... }
+        if parsed is None:
+            m = re.search(r'\{[^{}]*"condition"[^{}]*\}', raw, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    pass
+        # 4) Give up
+        if parsed is None:
+            raise ValueError(f"no JSON found in response: {raw[:120]}")
+        with _condition_lock:
+            _condition_cache = {"ts": now, "result": parsed}
+        print(f"[ollama] {parsed.get('condition', '?')} — {parsed.get('description', '')}")
+        return parsed
+
+    except Exception as e:
+        print(f"[ollama] failed ({e}) — falling back to rule-based")
+        fallback = _simple_condition(data)
+        # Cache the fallback too so we don't retry Ollama immediately
+        with _condition_lock:
+            _condition_cache = {"ts": now, "result": fallback}
+        return fallback
+
+
+def _warmup_ollama():
+    """Fire a tiny request to Ollama so the model is loaded before the first reading."""
+    if not OLLAMA_ENABLED:
+        return
+    print(f"[ollama] warming up model '{OLLAMA_MODEL}' (first inference can take a while)...")
+    try:
+        body = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": "Say 'ok'",
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            result = json.loads(resp.read())
+        raw = result.get("response", "").strip()
+        print(f"[ollama] warmup done — model replied: {raw[:60]}")
+    except Exception as e:
+        print(f"[ollama] warmup failed ({e}) — will retry on first reading")
+
+
+# ═══════════════════════════════════════════════════
 #  rtl_433 collector (daemon thread)
 # ═══════════════════════════════════════════════════
 
@@ -196,10 +382,21 @@ def _run_rtl433(conn, tcp):
                 continue
 
             insert(conn, msg)
+
+            # Analyze conditions and attach to the message
+            try:
+                analysis = analyze_weather(msg) if OLLAMA_ENABLED else _simple_condition(msg)
+                msg["condition"]   = analysis.get("condition")
+                msg["icon"]        = analysis.get("icon")
+                msg["description"] = analysis.get("description")
+            except Exception:
+                pass  # never block readings on analysis failure
+
             temp = msg.get("temperature_C", "?")
             hum = msg.get("humidity", "?")
             ts = msg.get("time", "?")
-            print(f"[collector] {ts}  temp={temp}°C  hum={hum}%")
+            cond = msg.get("condition", "?")
+            print(f"[collector] {ts}  temp={temp}°C  hum={hum}%  [{cond}]")
 
             if tcp:
                 tcp.broadcast((json.dumps(msg) + "\n").encode())
@@ -230,6 +427,9 @@ def _rtl433_loop():
             print(f"[tcp-push] failed to start ({e}) — continuing without")
     else:
         print("[tcp-push] disabled (set TCP_PORT to enable)")
+
+    # Warm up Ollama model before first reading (so it's loaded in GPU)
+    _warmup_ollama()
 
     try:
         while True:
@@ -330,7 +530,7 @@ def api_stats():
 def dashboard():
     hostname = socket.gethostname()
     lan_ip = _lan_ip()
-    web_url = f"{lan_ip}:8080"
+    web_url = f"{lan_ip}:{HTTP_PORT}"
     tcp_url = f"{lan_ip}:{TCP_PORT}" if TCP_PORT else "disabled"
 
     return _DASHBOARD_HTML.replace("__HOSTNAME__", hostname) \
@@ -897,7 +1097,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rtl433_loop, daemon=True).start()
 
     ip = _lan_ip()
-    print(f"[server] Dashboard  → http://{ip}:8080")
+    print(f"[server] Dashboard  → http://{ip}:{HTTP_PORT}")
     print(f"[server] TCP push   → {ip}:{TCP_PORT}" if TCP_PORT else "[server] TCP push   → disabled")
 
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=HTTP_PORT, debug=False)

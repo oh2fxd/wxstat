@@ -612,6 +612,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WX Station — 868.3 MHz</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/@sourcentis/chartjs-gauge@1.2.0/dist/chartjs-gauge.umd.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Share+Tech+Mono&display=swap');
 
@@ -797,6 +798,35 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     transition: width 0.5s;
   }
 
+  /* ── Gauges ────────────────────────────── */
+  .gauges {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(clamp(180px, 22vw, 260px), 1fr));
+    gap: clamp(10px, 1.5vw, 16px);
+    margin-bottom: clamp(20px, 3vw, 28px);
+  }
+  .gauge-box {
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    padding: clamp(10px, 1.5vw, 16px);
+    text-align: center;
+  }
+  .gauge-box .gauge-label {
+    font-family: var(--font);
+    font-size: clamp(0.65em, 0.85vw, 0.72em);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 4px;
+    text-align: left;
+  }
+  .gauge-box canvas {
+    width: 100% !important;
+    height: auto !important;
+  }
+
   /* ── Charts ────────────────────────────── */
   .charts {
     position: relative; z-index: 1;
@@ -926,6 +956,12 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="gauges">
+  <div class="gauge-box"><div class="gauge-label">▸ Temperature</div><canvas id="tempGauge" height="140"></canvas></div>
+  <div class="gauge-box"><div class="gauge-label">▸ Humidity</div><canvas id="humGauge" height="140"></canvas></div>
+  <div class="gauge-box"><div class="gauge-label">▸ Wind Speed</div><canvas id="windGauge" height="140"></canvas></div>
+</div>
+
 <div class="charts">
   <div class="chart-box"><h2>▸ Temperature · 24h</h2><canvas id="tempChart" height="100"></canvas></div>
   <div class="chart-box"><h2>▸ Humidity · 24h</h2><canvas id="humChart" height="100"></canvas></div>
@@ -1007,6 +1043,47 @@ function drawCompass(deg) {
     ' filter="drop-shadow(0 0 3px #00ff88)"' +
     ' transform="rotate(' + (deg||0) + ',50,50)" style="transition:transform 0.6s"/>' +
     '</svg>';
+}
+
+// ── Gauges ───────────────────────────────────
+function gaugeSegments(type) {
+  if (type === 'temp') return {
+    data: [35, 20, 20, 25], bg: ['#3b82f6','#22c55e','#eab308','#ef4444'],
+    min: -10, max: 50, circ: 180, rot: -90 };
+  if (type === 'hum') return {
+    data: [30, 40, 30], bg: ['#ef4444','#22c55e','#3b82f6'],
+    min: 0, max: 100, circ: 180, rot: -90 };
+  if (type === 'wind') return {
+    data: [33, 34, 33], bg: ['#22c55e','#eab308','#ef4444'],
+    min: 0, max: 30, circ: 270, rot: -135 };
+}
+
+function drawGauge(id, value, unit, type, color) {
+  var seg = gaugeSegments(type);
+  var ctx = document.getElementById(id).getContext('2d');
+  var key2 = id + '_g';
+
+  if (window[key2]) {
+    var chart = window[key2];
+    chart.data.datasets[0].value = value;
+    chart.update('default');
+    return;
+  }
+
+  window[key2] = new Chart(ctx, {
+    type: 'gauge',
+    data: { datasets: [{ value: value, data: seg.data, backgroundColor: seg.bg, borderWidth: 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      cutout: '75%', circumference: seg.circ, rotation: seg.rot,
+      gauge: {
+        minValue: seg.min, maxValue: seg.max,
+        valueLabel: { formatter: function(v) { return v.toFixed(1) + unit; }, color: color,
+          font: { size: 14, family: 'JetBrains Mono, monospace', weight: 'bold' } }
+      },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } }
+    }
+  });
 }
 
 // ── Charts (cyberpunk palette) ─────────────
@@ -1136,6 +1213,10 @@ async function refresh() {
       document.getElementById('age').textContent = age < 120 ? 'live' : Math.round(age / 60) + 'm ago';
       dot.className = age > 300 ? 'status-dot stale' : 'status-dot';
       document.getElementById('status-text').textContent = age > 300 ? 'Stale' : 'Live';
+
+      drawGauge('tempGauge', t != null ? t : 0, '°C', 'temp', C.magenta);
+      drawGauge('humGauge',  h != null ? h : 50, '%',  'hum',  C.cyan);
+      drawGauge('windGauge', ws != null ? ws : 0, ' m/s', 'wind', C.green);
 
       try {
         var sr = await fetch('/api/stats');

@@ -717,6 +717,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     gap: clamp(10px, 1.5vw, 16px);
     margin-bottom: clamp(20px, 3vw, 28px);
   }
+  .cards:has(.card-hero) { grid-template-columns: 2fr repeat(auto-fit, minmax(clamp(160px, 18vw, 220px), 1fr)); }
   .card {
     background: var(--surface);
     border-radius: var(--radius);
@@ -759,12 +760,46 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: clamp(0.65em, 0.9vw, 0.75em); color: var(--muted);
     margin-top: 2px;
   }
+  .card .trend {
+    font-family: var(--font);
+    font-size: clamp(0.7em, 1vw, 0.85em);
+    margin-left: 6px;
+    display: inline-block;
+    transition: opacity 0.3s;
+  }
+  .card .trend.up { color: var(--green); }
+  .card .trend.down { color: var(--red); }
+  .card .trend.flat { color: var(--muted); }
+  .card .fresh {
+    font-family: var(--font);
+    font-size: clamp(0.5em, 0.7vw, 0.6em);
+    color: #3b4261;
+    margin-top: 2px;
+  }
   .card .range {
     font-family: var(--font);
     font-size: clamp(0.58em, 0.8vw, 0.65em); color: #3b4261;
     margin-top: 8px; padding-top: 8px;
     border-top: 1px solid var(--border);
   }
+
+  /* hero temperature card */
+  .card-hero {
+    grid-column: 1 / -1;
+  }
+  .card-hero .main-val {
+    font-size: clamp(3em, 6vw, 5em);
+  }
+  .card-hero .card-row {
+    display: flex; align-items: baseline; gap: clamp(16px, 3vw, 32px);
+    flex-wrap: wrap;
+  }
+  .card-hero .card-row .hero-feels {
+    font-family: var(--font);
+    font-size: clamp(1em, 1.5vw, 1.5em);
+    color: var(--muted);
+  }
+  .card-hero .card-row .hero-feels .val { color: var(--text); font-weight: 600; }
 
   /* card-specific text colors */
   .card.temp .main-val { color: var(--magenta); text-shadow: 0 0 18px rgba(255,0,170,0.25); }
@@ -914,18 +949,25 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div class="cards">
-  <div class="card temp">
+  <div class="card temp card-hero">
     <div class="icon" id="icon-temp"></div>
     <div class="label">Temperature</div>
-    <div class="main-val" id="temp">--<span class="unit">°C</span></div>
-    <div class="sub" id="feels"></div>
+    <div class="card-row">
+      <div>
+        <span class="main-val" id="temp">--<span class="unit">°C</span></span>
+        <span class="trend" id="trend-temp"></span>
+      </div>
+      <div class="hero-feels">Feels like <span class="val" id="feels">--</span></div>
+    </div>
+    <div class="fresh" id="fresh-temp"></div>
     <div class="range" id="range-temp"></div>
   </div>
   <div class="card hum">
     <div class="icon" id="icon-hum"></div>
     <div class="label">Humidity</div>
-    <div class="main-val" id="hum">--<span class="unit">%</span></div>
+    <div><span class="main-val" id="hum">--<span class="unit">%</span></span><span class="trend" id="trend-hum"></span></div>
     <div class="sub" id="comfort"></div>
+    <div class="fresh" id="fresh-hum"></div>
     <div class="range" id="range-hum"></div>
   </div>
   <div class="card wind">
@@ -935,24 +977,27 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="compass" id="compass"></div>
       <div>
         <div style="font-family:var(--font);font-size:clamp(1.2em,1.8vw,1.4em);font-weight:800;" id="wind-dir">--</div>
-        <div class="sub" id="wind-speed">--</div>
+        <div><span class="main-val" style="font-size:clamp(1em,1.5vw,1.2em);" id="wind-speed">--</span><span class="trend" id="trend-wind"></span></div>
         <div class="sub" id="beaufort"></div>
       </div>
     </div>
+    <div class="fresh" id="fresh-wind"></div>
     <div class="range" id="range-wind"></div>
   </div>
   <div class="card dew">
     <div class="icon" id="icon-dew"></div>
     <div class="label">Dew Point</div>
-    <div class="main-val" id="dew">--<span class="unit">°C</span></div>
+    <div><span class="main-val" id="dew">--<span class="unit">°C</span></span><span class="trend" id="trend-dew"></span></div>
     <div class="sub" id="dew-note"></div>
+    <div class="fresh" id="fresh-dew"></div>
   </div>
   <div class="card rain">
     <div class="icon" id="icon-rain"></div>
     <div class="label">Rain Today</div>
-    <div class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></div>
+    <div><span class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></span><span class="trend" id="trend-rain"></span></div>
     <div class="rain-bar"><div class="rain-bar-fill" id="rain-bar" style="width:0%"></div></div>
     <div class="sub" style="margin-top:4px;" id="rain-total"></div>
+    <div class="fresh" id="fresh-rain"></div>
   </div>
 </div>
 
@@ -1156,9 +1201,33 @@ function drawChart(canvasId, rows, key, color, fromColor) {
 var lastId = 0;
 var failCount = 0;
 var historyRows = [];
+var _prev = {};
+var _now = 0;
+
+function setTrend(id, curr, prev, decimals) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  if (prev == null || curr == null) { el.textContent = ''; el.className = 'trend'; return; }
+  var diff = curr - prev;
+  var d = decimals != null ? diff.toFixed(decimals) : (diff > 0 ? '+' + diff.toFixed(1) : diff.toFixed(1));
+  if (diff > 0.05) { el.innerHTML = '▲' + d; el.className = 'trend up'; }
+  else if (diff < -0.05) { el.innerHTML = '▼' + d; el.className = 'trend down'; }
+  else { el.textContent = '→'; el.className = 'trend flat'; }
+}
+
+function setFresh(id, ts) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  if (!ts) { el.textContent = ''; return; }
+  var s = Math.round((Date.now() - ts) / 1000);
+  if (s < 10) el.textContent = 'just now';
+  else if (s < 60) el.textContent = s + 's ago';
+  else el.textContent = Math.round(s / 60) + 'm ago';
+}
 
 async function refresh() {
   var ok = false;
+  _now = Date.now();
   try {
     var r = await fetch('/api/current');
     if (!r.ok) { failCount++; }
@@ -1175,24 +1244,36 @@ async function refresh() {
 
       document.getElementById('icon-temp').textContent = tempIcon(t);
       document.getElementById('temp').innerHTML = (t != null ? t : '--') + '<span class="unit">°C</span>';
+      setTrend('trend-temp', t, _prev.t, 1);
+      setFresh('fresh-temp', _now);
+      _prev.t = t;
       var fl = '';
       if (t != null) {
         if (t < 0) fl = 'Freezing'; else if (t < 10) fl = 'Chilly'; else if (t < 20) fl = 'Mild'; else if (t < 28) fl = 'Warm'; else fl = 'Hot';
       }
-      document.getElementById('feels').textContent = fl;
+      document.getElementById('feels').innerHTML = '<span>' + fl + '</span>';
 
       document.getElementById('icon-hum').textContent = humIcon(h);
       document.getElementById('hum').innerHTML = (h != null ? h : '--') + '<span class="unit">%</span>';
+      setTrend('trend-hum', h, _prev.h, 0);
+      setFresh('fresh-hum', _now);
+      _prev.h = h;
       document.getElementById('comfort').innerHTML = comfort(h);
 
       document.getElementById('icon-wind').textContent = windIcon(wg);
       document.getElementById('wind-dir').textContent = windDirStr(wd);
-      document.getElementById('wind-speed').textContent = (ws != null ? ws.toFixed(1) : '--') + ' avg / ' + (wg != null ? wg.toFixed(1) : '--') + ' gust m/s';
+      document.getElementById('wind-speed').innerHTML = (ws != null ? ws.toFixed(1) : '--') + ' avg / ' + (wg != null ? wg.toFixed(1) : '--') + ' gust m/s';
+      setTrend('trend-wind', ws, _prev.ws, 2);
+      setFresh('fresh-wind', _now);
+      _prev.ws = ws;
       var bf = beaufort(ws);
       document.getElementById('beaufort').innerHTML = bf ? bf[1] + ' ' + bf[0] : '';
 
       document.getElementById('icon-dew').textContent = dewIcon(dp);
       document.getElementById('dew').innerHTML = (dp != null ? dp : '--') + '<span class="unit">°C</span>';
+      setTrend('trend-dew', dp, _prev.dp, 1);
+      setFresh('fresh-dew', _now);
+      _prev.dp = dp;
       var dn = '';
       if (dp != null && t != null) {
         var spread = t - dp;
@@ -1204,6 +1285,9 @@ async function refresh() {
 
       document.getElementById('icon-rain').textContent = rainIcon(rain);
       document.getElementById('rain').innerHTML = (rain != null ? rain.toFixed(1) : '--') + '<span class="unit"> mm</span>';
+      setTrend('trend-rain', rain, _prev.rain, 1);
+      setFresh('fresh-rain', _now);
+      _prev.rain = rain;
       document.getElementById('rain-bar').style.width = Math.min(100, ((rain||0) / 20) * 100) + '%';
       drawCompass(wd);
       document.getElementById('station-id').textContent = d.station_id || '--';

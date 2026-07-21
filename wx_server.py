@@ -6,8 +6,8 @@ Run:
     python3 wx_server.py # direct start (collector + dashboard)
 """
 import json
+import math
 import os
-import re
 import select
 import socket
 import sqlite3
@@ -175,6 +175,46 @@ class TCPPushServer:
 _condition_cache = {"ts": 0, "result": None}
 _condition_lock = threading.Lock()
 
+# Rain change-detection — rain_mm from the sensor is a cumulative counter,
+# NOT a current rate.  Once it has ever rained the counter stays > 0 forever,
+# so we must track whether rain is *actively* falling by watching for increases.
+_rain_state = {"last_mm": None, "increased_at": 0, "lock": threading.Lock()}
+_RECENT_RAIN_WINDOW = 1800  # 30 min — treat as rainy if rain increased this recently
+
+
+def _rain_is_active(rain_mm):
+    """Returns True if rain appears to be *actively* falling.
+
+    rtl_433 reports rain_mm as a cumulative total (since sensor start or reset),
+    so `rain_mm > 0` on its own is not enough — it could be from yesterday.
+    We track the last-seen value and only consider rain active if the counter
+    has increased within the recent window."""
+    if rain_mm is None or rain_mm <= 0:
+        return False
+
+    with _rain_state["lock"]:
+        now = time.time()
+        changed = _rain_state["last_mm"] is not None and rain_mm > _rain_state["last_mm"]
+
+        if changed:
+            _rain_state["last_mm"] = rain_mm
+            _rain_state["increased_at"] = now
+            return True
+
+        # First reading after startup — assume NOT raining (wait for increase)
+        if _rain_state["last_mm"] is None:
+            _rain_state["last_mm"] = rain_mm
+            _rain_state["increased_at"] = 0
+            return False
+
+        # No change since last reading — check recency window
+        if _rain_state["increased_at"] > 0 and (now - _rain_state["increased_at"]) < _RECENT_RAIN_WINDOW:
+            return True
+
+        # value hasn't changed and window expired — update tracking to current
+        _rain_state["last_mm"] = rain_mm
+        return False
+
 
 def _simple_condition(data):
     """Rule-based weather condition — always available, runs instantly."""
@@ -185,8 +225,8 @@ def _simple_condition(data):
     rain = data.get("rain_mm", 0)
     wind_dir = data.get("wind_dir_deg")
 
-    # Rain takes priority
-    if rain is not None and rain > 0:
+    # Rain takes priority (but only if actively raining — not stale cumulative total)
+    if _rain_is_active(rain):
         if wind_gust is not None and wind_gust > 30:
             return {"condition": "Stormy", "icon": "⛈️",
                     "description": f"Heavy rain with strong gusts {wind_gust} km/h, {temp}°C."}
@@ -238,86 +278,74 @@ def _simple_condition(data):
 
 
 def analyze_weather(data):
-    """Call local Ollama to interpret weather — cached for OLLAMA_CACHE_S seconds."""
+    """Call local Ollama for a natural-language description — condition & icon from rules."""
     global _condition_cache
 
     now = time.time()
+
+    # Condition and icon always from deterministic rules (never cached)
+    rule = _simple_condition(data)
+    cond = rule["condition"]
+    icon = rule["icon"]
+
+    # Cache only the Ollama description text (TTL = OLLAMA_CACHE_S)
+    desc_cache = None
     with _condition_lock:
         if _condition_cache["result"] and (now - _condition_cache["ts"]) < OLLAMA_CACHE_S:
-            return _condition_cache["result"]
+            desc_cache = _condition_cache["result"].get("description")
 
-    temp = data.get("temperature_C", "?")
-    hum = data.get("humidity", "?")
-    wind = data.get("wind_avg_km_h", "?")
-    gust = data.get("wind_max_km_h", "?")
-    wdir = data.get("wind_dir_deg", "?")
-    rain = data.get("rain_mm", "?")
+    if not desc_cache:
+        temp = data.get("temperature_C", "?")
+        hum  = data.get("humidity", "?")
+        wind = data.get("wind_avg_km_h", "?")
+        gust = data.get("wind_max_km_h", "?")
+        wdir = data.get("wind_dir_deg", "?")
+        rain = data.get("rain_mm", "?")
 
-    prompt = (
-        "You are a weather analyst. Return ONLY a JSON object, nothing else. No markdown, no explanation.\n\n"
-        f"Weather data: temperature={temp}°C, humidity={hum}%, wind_avg={wind} km/h, "
-        f"wind_gust={gust} km/h, wind_dir={wdir}°, rain={rain} mm\n\n"
-        'Return exactly: {"condition": "<short label>", "icon": "<one emoji>", "description": "<one sentence>"}\n'
-        'Conditions: Clear, Partly Cloudy, Overcast, Rainy, Stormy, Windy, Breezy, Foggy, Sleet, Snow'
-    )
-
-    try:
-        body = json.dumps({
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        }).encode()
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/generate",
-            data=body,
-            headers={"Content-Type": "application/json"},
+        prompt = (
+            f"Describe this weather in ONE short English sentence (max 15 words): "
+            f"{temp}°C, {hum}% humidity, wind {wind} avg/{gust} max km/h from {wdir}°, "
+            f"rain {rain} mm. Condition is: {cond}. Just the sentence, nothing else."
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-        raw = result.get("response", "").strip()
 
-        # Try to extract JSON — model may wrap it in markdown or text
-        parsed = None
-        # 1) Direct parse
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-        # 2) Strip ``` fences then parse
-        if parsed is None:
-            stripped = raw
-            if stripped.startswith("```"):
-                stripped = stripped.split("\n", 1)[-1]
-                if stripped.endswith("```"):
-                    stripped = stripped[:-3]
-                stripped = stripped.strip()
-            try:
-                parsed = json.loads(stripped)
-            except json.JSONDecodeError:
-                pass
-        # 3) Regex hunt for { ... }
-        if parsed is None:
-            m = re.search(r'\{[^{}]*"condition"[^{}]*\}', raw, re.DOTALL)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    pass
-        # 4) Give up
-        if parsed is None:
-            raise ValueError(f"no JSON found in response: {raw[:120]}")
-        with _condition_lock:
-            _condition_cache = {"ts": now, "result": parsed}
-        print(f"[ollama] {parsed.get('condition', '?')} — {parsed.get('description', '')}")
-        return parsed
+            body = json.dumps({
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+            }).encode()
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/generate",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+            desc_cache = result.get("response", "").strip()
 
-    except Exception as e:
-        print(f"[ollama] failed ({e}) — falling back to rule-based")
-        fallback = _simple_condition(data)
-        # Cache the fallback too so we don't retry Ollama immediately
+            # Clean up: remove quotes, take first sentence only
+            desc_cache = desc_cache.strip('"').strip("'")
+            if "." in desc_cache:
+                desc_cache = desc_cache.split(".")[0].strip() + "."
+            if len(desc_cache) > 120:
+                desc_cache = desc_cache[:117] + "..."
+
+            print(f"[ollama] {cond} — {desc_cache}")
+
+        except Exception as e:
+            print(f"[ollama] failed ({e}) — using rule-based description")
+            desc_cache = rule["description"]
+            if len(desc_cache) > 120:
+                desc_cache = desc_cache[:117] + "..."
+
+        # Cache the description for future reuse
         with _condition_lock:
-            _condition_cache = {"ts": now, "result": fallback}
-        return fallback
+            _condition_cache = {
+                "ts": now,
+                "result": {"condition": cond, "icon": icon, "description": desc_cache},
+            }
+
+    return {"condition": cond, "icon": icon, "description": desc_cache}
 
 
 def _warmup_ollama():
@@ -392,6 +420,19 @@ def _run_rtl433(conn, tcp):
             except Exception:
                 pass  # never block readings on analysis failure
 
+            # Compute today's rain delta so clients see useful numbers
+            # (raw rain_mm is cumulative since sensor boot, useless for display)
+            try:
+                tr = conn.execute(
+                    "SELECT MAX(rain_mm) - MIN(rain_mm) FROM readings WHERE time >= date('now')"
+                ).fetchone()
+                if tr and tr[0] is not None:
+                    msg["rain_mm"] = round(max(0, tr[0]), 1)  # overwrite with today's delta
+                else:
+                    msg["rain_mm"] = 0.0
+            except Exception:
+                pass
+
             temp = msg.get("temperature_C", "?")
             hum = msg.get("humidity", "?")
             ts = msg.get("time", "?")
@@ -399,7 +440,7 @@ def _run_rtl433(conn, tcp):
             print(f"[collector] {ts}  temp={temp}°C  hum={hum}%  [{cond}]")
 
             if tcp:
-                tcp.broadcast((json.dumps(msg) + "\n").encode())
+                tcp.broadcast((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
     except Exception as e:
         print(f"[collector] Error: {e}")
     finally:
@@ -466,7 +507,7 @@ def dew_point(t, h):
     if t is None or h is None:
         return None
     a, b = 17.27, 237.7
-    gamma = (a * t) / (b + t) + __import__("math").log(h / 100.0)
+    gamma = (a * t) / (b + t) + math.log(h / 100.0)
     return round((b * gamma) / (a - gamma), 1)
 
 
@@ -492,6 +533,19 @@ def api_current():
         return jsonify({"error": "no data"}), 404
     d = dict(row)
     d["dew_point_C"] = dew_point(d.get("temperature_C"), d.get("humidity"))
+
+    # Compute rain today from the cumulative counter
+    # (rain_mm is cumulative since sensor boot — subtract day-start min)
+    today_start = db.execute(
+        "SELECT MIN(rain_mm) as rain_start, MAX(rain_mm) as rain_end "
+        "FROM readings WHERE time >= date('now')"
+    ).fetchone()
+    d["rain_total_mm"] = d.get("rain_mm")  # raw cumulative
+    if today_start and today_start["rain_start"] is not None:
+        d["rain_today_mm"] = round(max(0, today_start["rain_end"] - today_start["rain_start"]), 1)
+    else:
+        d["rain_today_mm"] = 0.0
+
     return jsonify(d)
 
 
@@ -514,16 +568,24 @@ def api_history():
 
 @app.route("/api/stats")
 def api_stats():
-    """Today's min/max for each field."""
+    """Today's min/max for each field, plus rain today."""
     db = get_db()
-    rows = db.execute("""
+    row = db.execute("""
         SELECT MIN(temperature_C) as t_min, MAX(temperature_C) as t_max,
                MIN(humidity) as h_min, MAX(humidity) as h_max,
-               MAX(wind_max_m_s) as w_max
+               MAX(wind_max_m_s) as w_max,
+               MIN(rain_mm) as rain_start, MAX(rain_mm) as rain_end
         FROM readings
         WHERE time >= date('now')  -- UTC, matches collector datetimes
     """).fetchone()
-    return jsonify(dict(rows)) if rows else jsonify({})
+    if not row:
+        return jsonify({})
+    d = dict(row)
+    if d["rain_start"] is not None and d["rain_end"] is not None:
+        d["rain_today_mm"] = round(max(0, d["rain_end"] - d["rain_start"]), 1)
+    else:
+        d["rain_today_mm"] = 0.0
+    return jsonify(d)
 
 
 @app.route("/")
@@ -769,6 +831,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     );
   }
 
+  /* ── Chart pulse animation ────────────── */
+  @keyframes chartPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(0,240,255,0.2); }
+    50%  { box-shadow: 0 0 12px 4px rgba(0,240,255,0.15); }
+    100% { box-shadow: 0 0 0 0 rgba(0,240,255,0); }
+  }
+  .chart-pulse {
+    animation: chartPulse 0.8s ease-out;
+    border-radius: var(--radius);
+  }
+
   /* ── Responsive ────────────────────────── */
   @media (max-width: 700px) {
     .cards { grid-template-columns: repeat(2, 1fr); }
@@ -846,9 +919,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="card rain">
     <div class="icon" id="icon-rain"></div>
-    <div class="label">Rain Total</div>
+    <div class="label">Rain Today</div>
     <div class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></div>
     <div class="rain-bar"><div class="rain-bar-fill" id="rain-bar" style="width:0%"></div></div>
+    <div class="sub" style="margin-top:4px;" id="rain-total"></div>
   </div>
 </div>
 
@@ -938,21 +1012,49 @@ function drawCompass(deg) {
 // ── Charts (cyberpunk palette) ─────────────
 const C = { magenta:'#ff00aa', cyan:'#00f0ff', green:'#00ff88', purple:'#bd93f9' };
 
+function pulseChart(id) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove('chart-pulse');
+  void el.offsetWidth;
+  el.classList.add('chart-pulse');
+  setTimeout(function() { el.classList.remove('chart-pulse'); }, 800);
+}
+
+function makeGrad(ctx, h, fromColor) {
+  var g = ctx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, fromColor + '50');
+  g.addColorStop(1, fromColor + '05');
+  return g;
+}
+
 function drawChart(canvasId, rows, key, color, fromColor) {
   const ctx = document.getElementById(canvasId).getContext('2d');
   const labels = rows.map(r => r.time.slice(11,16));
   const data = rows.map(r => r[key]);
   const key2 = canvasId + '_chart';
-  if (window[key2]) window[key2].destroy();
-  var grad = ctx.createLinearGradient(0, 0, 0, 110);
-  grad.addColorStop(0, fromColor + '50');
-  grad.addColorStop(1, fromColor + '05');
+
+  if (window[key2]) {
+    var chart = window[key2];
+    var ch = chart.chartArea ? chart.chartArea.bottom : 110;
+    var grad = makeGrad(chart.ctx, ch, fromColor);
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.data.datasets[0].backgroundColor = grad;
+    chart.update('default');
+    pulseChart(canvasId);
+    return;
+  }
+
   window[key2] = new Chart(ctx, {
     type: 'line',
-    data: { labels, datasets: [{ data, borderColor: color, backgroundColor: grad, borderWidth: 2, pointRadius: 0,
-      tension: 0.35, fill: true }] },
+    data: { labels, datasets: [{ data, borderColor: color, backgroundColor: makeGrad(ctx, 110, fromColor),
+      borderWidth: 2, pointRadius: 0, tension: 0.35, fill: true }] },
     options: {
-      responsive: true, animation: { duration: 400 },
+      responsive: true,
+      animation: { duration: 600, easing: 'easeOutCubic',
+        y: { from: function(a) { if (a.type === 'data' && a.index > 0) return a.dataset.data[a.index - 1]; } }
+      },
       interaction: { intersect: false, mode: 'index' },
       scales: {
         x: { ticks: { color: '#3b4261', maxTicksLimit: 10, font: { size: 10, family: 'monospace' } },
@@ -991,7 +1093,7 @@ async function refresh() {
       var ws = d.wind_avg_m_s;
       var wg = d.wind_max_m_s;
       var wd = d.wind_dir_deg;
-      var rain = d.rain_mm;
+      var rain = d.rain_today_mm;
       var dp = d.dew_point_C;
 
       document.getElementById('icon-temp').textContent = tempIcon(t);
@@ -1041,6 +1143,9 @@ async function refresh() {
         document.getElementById('range-temp').textContent = s.t_min != null ? '↓ ' + s.t_min + '°  ↑ ' + s.t_max + '°' : '';
         document.getElementById('range-hum').textContent = s.h_min != null ? '↓ ' + s.h_min + '%  ↑ ' + s.h_max + '%' : '';
         document.getElementById('range-wind').textContent = s.w_max != null ? 'Gust max ' + s.w_max.toFixed(1) + ' m/s' : '';
+        document.getElementById('rain-total').textContent =
+          (d.rain_total_mm != null ? 'Total: ' + d.rain_total_mm.toFixed(1) + ' mm' : '') +
+          (s.rain_today_mm != null ? ' · Today: ' + s.rain_today_mm.toFixed(1) + ' mm' : '');
       } catch(e) {}
     }
   } catch(e) { failCount++; }

@@ -63,21 +63,21 @@ Deferred to future release.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CHRT-01 | Phase 1 | Pending |
-| CHRT-02 | Phase 1 | Pending |
-| CHRT-03 | Phase 1 | Pending |
-| GAUG-01 | Phase 1 | Pending |
-| GAUG-02 | Phase 1 | Pending |
-| GAUG-03 | Phase 1 | Pending |
-| COND-01 | Phase 1 | Pending |
-| COND-02 | Phase 1 | Pending |
-| COND-03 | Phase 1 | Pending |
-| COND-04 | Phase 1 | Pending |
+| CHRT-01 | Phase 1: Animated Charts | Pending |
+| CHRT-02 | Phase 1: Animated Charts | Pending |
+| CHRT-03 | Phase 1: Animated Charts | Pending |
+| GAUG-01 | Phase 2: Analog Gauges | Pending |
+| GAUG-02 | Phase 2: Analog Gauges | Pending |
+| GAUG-03 | Phase 2: Analog Gauges | Pending |
+| COND-01 | Phase 3: Current Conditions Panel | Pending |
+| COND-02 | Phase 3: Current Conditions Panel | Pending |
+| COND-03 | Phase 3: Current Conditions Panel | Pending |
+| COND-04 | Phase 3: Current Conditions Panel | Pending |
 
 **Coverage:**
 - v1 requirements: 10 total
-- Mapped to phases: 0
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-07-21*

@@ -58,6 +58,16 @@ First launch output:
 
 Open **http://localhost:8085** for the dashboard.
 
+### 3. RTL-SDR Hardware Check & Console Monitor
+
+Verify hardware responsiveness and view formatted weather packets directly in your terminal:
+
+```bash
+./check_sdr.py            # Live stream weather packets from 868.3 MHz
+./check_sdr.py --once     # Verify SDR tuner and exit after 1 packet
+./check_sdr.py --db -n 5  # Display latest 5 records stored in SQLite database
+```
+
 ---
 
 ## Ollama Weather Analysis
@@ -197,6 +207,7 @@ TCP_PORT=0 ./start.sh
 ```
 wxstat/
 ├── wx_server.py      # Collector + SQLite + Flask + TCP push + Ollama analysis
+├── check_sdr.py      # Console diagnostic & live SDR / DB weather monitor
 ├── start.sh          # One-command launcher (Linux + macOS)
 ├── push.sh           # git add -A + commit + push helper
 ├── LICENSE           # MIT

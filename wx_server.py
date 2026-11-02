@@ -22,12 +22,27 @@ import flask
 from flask import Flask, g, jsonify, request
 
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxstat.db")
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wx_config.json")
 app = Flask(__name__)
 
+def _load_frequency():
+    freq = os.environ.get("WX_FREQ")
+    if freq:
+        return freq
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("frequency", "868.3M")
+        except Exception:
+            pass
+    return "868.3M"
+
+WX_FREQ = _load_frequency()
 RTL_CMD = [
     "rtl_433",
     "-Y", "classic",
-    "-f", "868.3M",
+    "-f", WX_FREQ,
     "-s", "250k",
     "-g", "20",
     "-F", "json",

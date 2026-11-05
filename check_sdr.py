@@ -324,6 +324,7 @@ def main():
     parser.add_argument("--db", action="store_true", help="Show latest reading from SQLite database instead of live SDR capture")
     parser.add_argument("--scan", action="store_true", help="Scan 868MHz band to find weather station frequency")
     parser.add_argument("--dwell", type=int, default=52, help="Dwell time per channel during --scan (default: 52s)")
+    parser.add_argument("--last", type=int, default=1, help="Number of recent records to show in --db mode (default: 1)")
     args = parser.parse_args()
 
     print(colored("================================───────────────────────────", BOLD))

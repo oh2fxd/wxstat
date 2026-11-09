@@ -17,10 +17,13 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 import flask
 from flask import Flask, g, jsonify, request
 
+_START_TIME = time.time()
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxstat.db")
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wx_config.json")
 app = Flask(__name__)
@@ -56,6 +59,287 @@ OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() in ("1", "true
 OLLAMA_URL     = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
 OLLAMA_CACHE_S = int(os.environ.get("OLLAMA_CACHE_S", 300))
+
+
+# ═══════════════════════════════════════════════════
+#  Explicit State Machines (UX / DX / AX Architecture)
+# ═══════════════════════════════════════════════════
+
+class BatteryState(str, Enum):
+    """Hardware battery states reported by Fine Offset WHx080 sensor."""
+    OK = "OK"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class SensorSignalState(str, Enum):
+    """Reception freshness states of the sensor wireless telemetry."""
+    LIVE = "LIVE"        # < 120s
+    RECENT = "RECENT"    # 120s - 300s
+    STALE = "STALE"      # > 300s
+    UNKNOWN = "UNKNOWN"  # no data
+
+
+class WeatherCategory(str, Enum):
+    """Categorical classification of weather conditions."""
+    STORMY = "Stormy"
+    RAINY_WINDY = "Rainy & Windy"
+    SLEET = "Sleet"
+    RAINY = "Rainy"
+    WINDY = "Windy"
+    BREEZY = "Breezy"
+    FOGGY = "Foggy"
+    OVERCAST = "Overcast"
+    CLEAR = "Clear"
+    PARTLY_CLOUDY = "Partly Cloudy"
+
+
+class CollectorState(str, Enum):
+    """Lifecycle states of the rtl_433 SDR collector subprocess."""
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    RECEIVING = "RECEIVING"
+    RETRY_WAITING = "RETRY_WAITING"
+    ERROR = "ERROR"
+
+
+class CollectorStateMachine:
+    """Thread-safe state machine governing the rtl_433 SDR decoder subprocess."""
+
+    def __init__(self, frequency: str):
+        self._lock = threading.RLock()
+        self.state: CollectorState = CollectorState.STOPPED
+        self.frequency: str = frequency
+        self.pid: Optional[int] = None
+        self.started_at: Optional[float] = None
+        self.last_packet_time: Optional[float] = None
+        self.packets_received: int = 0
+        self.restart_count: int = 0
+        self.last_error: Optional[str] = None
+
+    def on_starting(self, pid: Optional[int] = None, frequency: Optional[str] = None) -> None:
+        with self._lock:
+            self.state = CollectorState.STARTING
+            self.pid = pid
+            if frequency:
+                self.frequency = frequency
+            self.started_at = time.time()
+            self.last_error = None
+
+    def on_packet_received(self) -> None:
+        with self._lock:
+            self.state = CollectorState.RECEIVING
+            self.packets_received += 1
+            self.last_packet_time = time.time()
+
+    def on_retry_wait(self, error: Optional[str] = None) -> None:
+        with self._lock:
+            self.state = CollectorState.RETRY_WAITING
+            self.pid = None
+            self.restart_count += 1
+            if error:
+                self.last_error = error
+
+    def on_stopped(self) -> None:
+        with self._lock:
+            self.state = CollectorState.STOPPED
+            self.pid = None
+
+    def on_error(self, error: str) -> None:
+        with self._lock:
+            self.state = CollectorState.ERROR
+            self.last_error = error
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            packet_age_s = round(now - self.last_packet_time, 1) if self.last_packet_time else None
+            uptime_s = (
+                round(now - self.started_at, 1)
+                if self.started_at and self.state in (CollectorState.STARTING, CollectorState.RECEIVING)
+                else 0.0
+            )
+            return {
+                "state": self.state.value,
+                "pid": self.pid,
+                "frequency": self.frequency,
+                "uptime_s": uptime_s,
+                "packets_received": self.packets_received,
+                "packet_age_s": packet_age_s,
+                "restart_count": self.restart_count,
+                "last_error": self.last_error,
+            }
+
+
+class RainActivityState(str, Enum):
+    """Precipitation activity states detected from sensor cumulative gauge."""
+    NO_DATA = "NO_DATA"
+    DRY = "DRY"
+    ACTIVE_RAIN = "ACTIVE_RAIN"
+    RECENT_RAIN = "RECENT_RAIN"
+
+
+class RainStateMachine:
+    """Thread-safe state machine for sensor precipitation tracking.
+
+    rtl_433 reports rain_mm as a cumulative total since sensor reset.
+    This machine handles:
+    - Initial baseline acquisition
+    - Transition to ACTIVE_RAIN on counter advance
+    - Transition to RECENT_RAIN during the 30-min window after rain stops
+    - Transition to DRY after the window elapses
+    - Graceful recovery when sensor battery is changed / counter resets
+    """
+
+    def __init__(self, window_seconds: int = 1800):
+        self._lock = threading.RLock()
+        self.window_seconds: int = window_seconds
+        self.state: RainActivityState = RainActivityState.NO_DATA
+        self.last_mm: Optional[float] = None
+        self.increased_at: float = 0.0
+
+    def update(self, rain_mm: Optional[float], now: Optional[float] = None) -> "RainStateMachine":
+        if now is None:
+            now = time.time()
+
+        if rain_mm is None or rain_mm < 0:
+            return self
+
+        with self._lock:
+            # First reading initialization
+            if self.last_mm is None:
+                self.last_mm = rain_mm
+                self.state = RainActivityState.DRY
+                return self
+
+            # Counter reset detection (e.g. battery swapped or sensor reconnected)
+            if rain_mm < self.last_mm - 5.0:
+                print(f"[rain-fsm] Sensor counter reset detected ({self.last_mm}mm -> {rain_mm}mm)")
+                self.last_mm = rain_mm
+                self.state = RainActivityState.DRY
+                return self
+
+            # Gauge increased: actively raining right now
+            if rain_mm > self.last_mm:
+                self.last_mm = rain_mm
+                self.increased_at = now
+                self.state = RainActivityState.ACTIVE_RAIN
+                return self
+
+            # Counter did not advance on this tick
+            self.last_mm = rain_mm
+            if self.increased_at > 0 and (now - self.increased_at) < self.window_seconds:
+                self.state = RainActivityState.RECENT_RAIN
+            else:
+                self.state = RainActivityState.DRY
+
+            return self
+
+    @property
+    def is_active(self) -> bool:
+        with self._lock:
+            return self.state in (RainActivityState.ACTIVE_RAIN, RainActivityState.RECENT_RAIN)
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            sec_since_increase = round(now - self.increased_at, 1) if self.increased_at > 0 else None
+            is_act = self.state in (RainActivityState.ACTIVE_RAIN, RainActivityState.RECENT_RAIN)
+            return {
+                "state": self.state.value,
+                "is_active": is_act,
+                "last_mm": self.last_mm,
+                "seconds_since_rain": sec_since_increase,
+                "window_s": self.window_seconds,
+            }
+
+
+class OllamaState(str, Enum):
+    """States of the local LLM weather descriptor."""
+    DISABLED = "DISABLED"
+    WARMING_UP = "WARMING_UP"
+    READY = "READY"
+    DEGRADED = "DEGRADED"
+
+
+class OllamaStateMachine:
+    """Thread-safe state machine governing local Ollama LLM integration."""
+
+    def __init__(self, enabled: bool, url: str, model: str, cache_ttl_s: int):
+        self._lock = threading.RLock()
+        self.state: OllamaState = OllamaState.DISABLED if not enabled else OllamaState.WARMING_UP
+        self.url: str = url
+        self.model: str = model
+        self.cache_ttl_s: int = cache_ttl_s
+        self.cached_result: Optional[Dict[str, Any]] = None
+        self.cached_at: float = 0.0
+        self.success_count: int = 0
+        self.fallback_count: int = 0
+        self.last_latency_s: Optional[float] = None
+        self.last_error: Optional[str] = None
+
+    def record_warmup_success(self, raw_reply: str) -> None:
+        with self._lock:
+            self.state = OllamaState.READY
+            self.last_error = None
+
+    def record_warmup_failure(self, error: str) -> None:
+        with self._lock:
+            self.state = OllamaState.DEGRADED
+            self.last_error = error
+
+    def record_success(self, cond: str, icon: str, desc: str, latency_s: float, now: float) -> None:
+        with self._lock:
+            self.state = OllamaState.READY
+            self.success_count += 1
+            self.last_latency_s = latency_s
+            self.last_error = None
+            self.cached_at = now
+            self.cached_result = {"condition": cond, "icon": icon, "description": desc, "source": "ollama"}
+
+    def record_fallback(self, error: str) -> None:
+        with self._lock:
+            self.state = OllamaState.DEGRADED
+            self.fallback_count += 1
+            self.last_error = error
+
+    def get_cached_description(self, now: float) -> Optional[str]:
+        with self._lock:
+            if self.cached_result and (now - self.cached_at) < self.cache_ttl_s:
+                return self.cached_result.get("description")
+            return None
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self.state.value,
+                "model": self.model,
+                "url": self.url,
+                "cache_ttl_s": self.cache_ttl_s,
+                "last_latency_s": self.last_latency_s,
+                "success_count": self.success_count,
+                "fallback_count": self.fallback_count,
+                "last_error": self.last_error,
+            }
+
+
+class TCPServerState(str, Enum):
+    """Lifecycle states of the TCP push broadcast server."""
+    STOPPED = "STOPPED"
+    LISTENING = "LISTENING"
+    ERROR = "ERROR"
+
+
+# Global state machine instances
+collector_fsm = CollectorStateMachine(frequency=WX_FREQ)
+rain_fsm = RainStateMachine(window_seconds=1800)
+ollama_fsm = OllamaStateMachine(
+    enabled=OLLAMA_ENABLED,
+    url=OLLAMA_URL,
+    model=OLLAMA_MODEL,
+    cache_ttl_s=OLLAMA_CACHE_S,
+)
+tcp_server: Optional["TCPPushServer"] = None
 
 
 # ═══════════════════════════════════════════════════
@@ -121,23 +405,33 @@ class TCPPushServer:
     Each reading is sent as a newline-delimited JSON object.
     Clients just open a raw TCP socket and read lines."""
 
-    def __init__(self, port):
+    def __init__(self, port: int):
         self.port = port
         self.clients = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.state: TCPServerState = TCPServerState.STOPPED
+        self.messages_broadcast: int = 0
+        self.total_clients_served: int = 0
+        self.last_broadcast_time: Optional[float] = None
         self._running = True
 
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("0.0.0.0", port))
-        self._server.listen(5)
-        self._server.setblocking(False)
+        try:
+            self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._server.bind(("0.0.0.0", port))
+            self._server.listen(5)
+            self._server.setblocking(False)
+            self.state = TCPServerState.LISTENING
 
-        self._accept_thread = threading.Thread(
-            target=self._accept_loop, daemon=True
-        )
-        self._accept_thread.start()
-        print(f"[tcp-push] listening on port {port}")
+            self._accept_thread = threading.Thread(
+                target=self._accept_loop, daemon=True
+            )
+            self._accept_thread.start()
+            print(f"[tcp-push] listening on port {port}")
+        except Exception as e:
+            self.state = TCPServerState.ERROR
+            print(f"[tcp-push] failed to bind port {port}: {e}")
+            raise
 
     def _accept_loop(self):
         while self._running:
@@ -148,12 +442,13 @@ class TCPPushServer:
                     sock.setblocking(False)
                     with self._lock:
                         self.clients.append(sock)
-                    n = len(self.clients)
+                        self.total_clients_served += 1
+                        n = len(self.clients)
                     print(f"[tcp-push] client {addr[0]}:{addr[1]} ({n} connected)")
             except Exception:
                 pass
 
-    def broadcast(self, line):
+    def broadcast(self, line: bytes):
         """Send a line to all clients, pruning disconnected ones."""
         with self._lock:
             alive = []
@@ -167,6 +462,8 @@ class TCPPushServer:
                     except Exception:
                         pass
             self.clients = alive
+            self.messages_broadcast += 1
+            self.last_broadcast_time = time.time()
 
     def stop(self):
         self._running = False
@@ -177,10 +474,25 @@ class TCPPushServer:
                 except Exception:
                     pass
             self.clients = []
+            self.state = TCPServerState.STOPPED
         try:
             self._server.close()
         except Exception:
             pass
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            return {
+                "state": self.state.value,
+                "port": self.port,
+                "active_clients": len(self.clients),
+                "total_clients_served": self.total_clients_served,
+                "messages_broadcast": self.messages_broadcast,
+                "last_broadcast_age_s": (
+                    round(now - self.last_broadcast_time, 1) if self.last_broadcast_time else None
+                ),
+            }
 
 
 # ═══════════════════════════════════════════════════
@@ -200,35 +512,13 @@ _RECENT_RAIN_WINDOW = 1800  # 30 min — treat as rainy if rain increased this r
 def _rain_is_active(rain_mm):
     """Returns True if rain appears to be *actively* falling.
 
-    rtl_433 reports rain_mm as a cumulative total (since sensor start or reset),
-    so `rain_mm > 0` on its own is not enough — it could be from yesterday.
-    We track the last-seen value and only consider rain active if the counter
-    has increased within the recent window."""
-    if rain_mm is None or rain_mm <= 0:
-        return False
-
+    rtl_433 reports rain_mm as a cumulative total (since sensor start or reset).
+    Delegates to RainStateMachine while maintaining full backward compatibility."""
+    state = rain_fsm.update(rain_mm)
     with _rain_state["lock"]:
-        now = time.time()
-        changed = _rain_state["last_mm"] is not None and rain_mm > _rain_state["last_mm"]
-
-        if changed:
-            _rain_state["last_mm"] = rain_mm
-            _rain_state["increased_at"] = now
-            return True
-
-        # First reading after startup — assume NOT raining (wait for increase)
-        if _rain_state["last_mm"] is None:
-            _rain_state["last_mm"] = rain_mm
-            _rain_state["increased_at"] = 0
-            return False
-
-        # No change since last reading — check recency window
-        if _rain_state["increased_at"] > 0 and (now - _rain_state["increased_at"]) < _RECENT_RAIN_WINDOW:
-            return True
-
-        # value hasn't changed and window expired — update tracking to current
-        _rain_state["last_mm"] = rain_mm
-        return False
+        _rain_state["last_mm"] = rain_fsm.last_mm
+        _rain_state["increased_at"] = rain_fsm.increased_at
+    return state.is_active
 
 
 def _simple_condition(data):
@@ -293,9 +583,7 @@ def _simple_condition(data):
 
 
 def analyze_weather(data):
-    """Call local Ollama for a natural-language description — condition & icon from rules."""
-    global _condition_cache
-
+    """Call local Ollama for natural-language description — condition & icon from rules."""
     now = time.time()
 
     # Condition and icon always from deterministic rules (never cached)
@@ -303,71 +591,72 @@ def analyze_weather(data):
     cond = rule["condition"]
     icon = rule["icon"]
 
+    if not OLLAMA_ENABLED:
+        return {"condition": cond, "icon": icon, "description": rule["description"], "source": "rule_fallback"}
+
     # Cache only the Ollama description text (TTL = OLLAMA_CACHE_S)
-    desc_cache = None
-    with _condition_lock:
-        if _condition_cache["result"] and (now - _condition_cache["ts"]) < OLLAMA_CACHE_S:
-            desc_cache = _condition_cache["result"].get("description")
+    desc_cache = ollama_fsm.get_cached_description(now)
+    if desc_cache:
+        return {"condition": cond, "icon": icon, "description": desc_cache, "source": "ollama_cache"}
 
-    if not desc_cache:
-        temp = data.get("temperature_C", "?")
-        hum  = data.get("humidity", "?")
-        wind = data.get("wind_avg_km_h", "?")
-        gust = data.get("wind_max_km_h", "?")
-        wdir = data.get("wind_dir_deg", "?")
-        rain = data.get("rain_mm", "?")
+    temp = data.get("temperature_C", "?")
+    hum  = data.get("humidity", "?")
+    wind = data.get("wind_avg_km_h", "?")
+    gust = data.get("wind_max_km_h", "?")
+    wdir = data.get("wind_dir_deg", "?")
+    rain = data.get("rain_mm", "?")
 
-        prompt = (
-            f"Describe this weather in ONE short English sentence (max 15 words): "
-            f"{temp}°C, {hum}% humidity, wind {wind} avg/{gust} max km/h from {wdir}°, "
-            f"rain {rain} mm. Condition is: {cond}. Just the sentence, nothing else."
+    prompt = (
+        f"Describe this weather in ONE short English sentence (max 15 words): "
+        f"{temp}°C, {hum}% humidity, wind {wind} avg/{gust} max km/h from {wdir}°, "
+        f"rain {rain} mm. Condition is: {cond}. Just the sentence, nothing else."
+    )
+
+    t0 = time.time()
+    source = "ollama"
+    try:
+        body = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
         )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        desc = result.get("response", "").strip()
 
-        try:
-            body = json.dumps({
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            }).encode()
-            req = urllib.request.Request(
-                f"{OLLAMA_URL}/api/generate",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read())
-            desc_cache = result.get("response", "").strip()
+        # Clean up: remove quotes, take first sentence only
+        desc = desc.strip('"').strip("'")
+        if "." in desc:
+            desc = desc.split(".")[0].strip() + "."
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
 
-            # Clean up: remove quotes, take first sentence only
-            desc_cache = desc_cache.strip('"').strip("'")
-            if "." in desc_cache:
-                desc_cache = desc_cache.split(".")[0].strip() + "."
-            if len(desc_cache) > 120:
-                desc_cache = desc_cache[:117] + "..."
+        latency = round(time.time() - t0, 2)
+        ollama_fsm.record_success(cond, icon, desc, latency, now)
+        print(f"[ollama] {cond} — {desc} ({latency}s)")
 
-            print(f"[ollama] {cond} — {desc_cache}")
+    except Exception as e:
+        latency = round(time.time() - t0, 2)
+        ollama_fsm.record_fallback(str(e))
+        print(f"[ollama] failed ({e}) — using rule-based description")
+        desc = rule["description"]
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+        source = "rule_fallback"
 
-        except Exception as e:
-            print(f"[ollama] failed ({e}) — using rule-based description")
-            desc_cache = rule["description"]
-            if len(desc_cache) > 120:
-                desc_cache = desc_cache[:117] + "..."
-
-        # Cache the description for future reuse
-        with _condition_lock:
-            _condition_cache = {
-                "ts": now,
-                "result": {"condition": cond, "icon": icon, "description": desc_cache},
-            }
-
-    return {"condition": cond, "icon": icon, "description": desc_cache}
+    return {"condition": cond, "icon": icon, "description": desc, "source": source}
 
 
 def _warmup_ollama():
     """Fire a tiny request to Ollama so the model is loaded before the first reading."""
     if not OLLAMA_ENABLED:
         return
-    print(f"[ollama] warming up model '{OLLAMA_MODEL}' (first inference can take a while)...")
+    print(f"[ollama] warming up model '{OLLAMA_MODEL}'...")
     try:
         body = json.dumps({
             "model": OLLAMA_MODEL,
@@ -379,11 +668,13 @@ def _warmup_ollama():
             data=body,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
         raw = result.get("response", "").strip()
+        ollama_fsm.record_warmup_success(raw)
         print(f"[ollama] warmup done — model replied: {raw[:60]}")
     except Exception as e:
+        ollama_fsm.record_warmup_failure(str(e))
         print(f"[ollama] warmup failed ({e}) — will retry on first reading")
 
 
@@ -404,6 +695,7 @@ def _run_rtl433(conn, tcp):
     proc = subprocess.Popen(
         RTL_CMD, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
+    collector_fsm.on_starting(pid=proc.pid, frequency=WX_FREQ)
     stderr_lines = []
     stderr_thread = threading.Thread(
         target=_drain_stderr,
@@ -412,6 +704,7 @@ def _run_rtl433(conn, tcp):
     )
     stderr_thread.start()
 
+    last_err = None
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -424,6 +717,7 @@ def _run_rtl433(conn, tcp):
             if msg.get("model") != "Fineoffset-WHx080":
                 continue
 
+            collector_fsm.on_packet_received()
             insert(conn, msg)
 
             # Analyze conditions and attach to the message
@@ -457,6 +751,7 @@ def _run_rtl433(conn, tcp):
             if tcp:
                 tcp.broadcast((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
     except Exception as e:
+        last_err = str(e)
         print(f"[collector] Error: {e}")
     finally:
         proc.kill()
@@ -465,20 +760,22 @@ def _run_rtl433(conn, tcp):
         except subprocess.TimeoutExpired:
             pass
         stderr_thread.join(timeout=2)
+        err_summary = "; ".join(stderr_lines[-3:]) if stderr_lines else last_err
+        collector_fsm.on_retry_wait(error=err_summary)
         for l in stderr_lines:
             print(l, flush=True)
 
 
 def _rtl433_loop():
     """Daemon thread: keep rtl_433 running, restarting on failure."""
+    global tcp_server
     conn = sqlite3.connect(DB)
     init_db(conn)
     print(f"[collector] DB ready: {DB}")
 
-    tcp = None
     if TCP_PORT:
         try:
-            tcp = TCPPushServer(TCP_PORT)
+            tcp_server = TCPPushServer(TCP_PORT)
         except Exception as e:
             print(f"[tcp-push] failed to start ({e}) — continuing without")
     else:
@@ -490,12 +787,13 @@ def _rtl433_loop():
     try:
         while True:
             print("[collector] Starting rtl_433...")
-            _run_rtl433(conn, tcp)
+            _run_rtl433(conn, tcp_server)
             print("[collector] rtl_433 exited, restarting in 10s...")
             time.sleep(10)
     finally:
-        if tcp:
-            tcp.stop()
+        collector_fsm.on_stopped()
+        if tcp_server:
+            tcp_server.stop()
         conn.close()
 
 
@@ -561,7 +859,113 @@ def api_current():
     else:
         d["rain_today_mm"] = 0.0
 
+    # Observable precipitation FSM state
+    d["rain_state"] = rain_fsm.state.value
+    d["rain_is_active"] = rain_fsm.is_active
+
+    # Battery state machine
+    batt = d.get("battery_ok")
+    if batt == 1:
+        d["battery_state"] = BatteryState.OK.value
+    elif batt == 0:
+        d["battery_state"] = BatteryState.LOW.value
+    else:
+        d["battery_state"] = BatteryState.UNKNOWN.value
+
+    # Signal freshness state machine
+    if d.get("time"):
+        try:
+            t_str = d["time"].replace("Z", "+00:00")
+            t_parsed = datetime.fromisoformat(t_str)
+            if t_parsed.tzinfo is None:
+                t_parsed = t_parsed.replace(tzinfo=timezone.utc)
+            age_s = max(0.0, (datetime.now(timezone.utc) - t_parsed).total_seconds())
+            d["sensor_age_s"] = round(age_s, 1)
+            if age_s < 120:
+                d["signal_state"] = SensorSignalState.LIVE.value
+            elif age_s <= 300:
+                d["signal_state"] = SensorSignalState.RECENT.value
+            else:
+                d["signal_state"] = SensorSignalState.STALE.value
+        except Exception:
+            d["sensor_age_s"] = None
+            d["signal_state"] = SensorSignalState.UNKNOWN.value
+    else:
+        d["sensor_age_s"] = None
+        d["signal_state"] = SensorSignalState.UNKNOWN.value
+
     return jsonify(d)
+
+
+@app.route("/api/status")
+def api_status():
+    """System health and comprehensive state machine observatory (AX / DX)."""
+    db = get_db()
+    try:
+        row = db.execute("SELECT COUNT(*), MAX(time) FROM readings").fetchone()
+        readings_count = row[0] if row else 0
+        last_db_time = row[1] if row else None
+    except Exception:
+        readings_count = 0
+        last_db_time = None
+
+    coll_status = collector_fsm.get_status()
+    rain_status = rain_fsm.get_status()
+    ollama_status = ollama_fsm.get_status()
+    tcp_status = tcp_server.get_status() if tcp_server else {"state": "DISABLED", "port": TCP_PORT}
+
+    sensor_info = {
+        "station_id": None,
+        "battery_state": BatteryState.UNKNOWN.value,
+        "signal_state": SensorSignalState.UNKNOWN.value,
+        "age_s": None,
+        "last_seen": last_db_time,
+    }
+    if last_db_time:
+        try:
+            latest = db.execute("SELECT station_id, battery_ok, time FROM readings ORDER BY id DESC LIMIT 1").fetchone()
+            if latest:
+                b = latest["battery_ok"]
+                sensor_info["station_id"] = latest["station_id"]
+                sensor_info["battery_state"] = (
+                    BatteryState.OK.value if b == 1 else (BatteryState.LOW.value if b == 0 else BatteryState.UNKNOWN.value)
+                )
+                t_parsed = datetime.fromisoformat(latest["time"].replace("Z", "+00:00"))
+                if t_parsed.tzinfo is None:
+                    t_parsed = t_parsed.replace(tzinfo=timezone.utc)
+                age = max(0.0, (datetime.now(timezone.utc) - t_parsed).total_seconds())
+                sensor_info["age_s"] = round(age, 1)
+                if age < 120:
+                    sensor_info["signal_state"] = SensorSignalState.LIVE.value
+                elif age <= 300:
+                    sensor_info["signal_state"] = SensorSignalState.RECENT.value
+                else:
+                    sensor_info["signal_state"] = SensorSignalState.STALE.value
+        except Exception:
+            pass
+
+    if coll_status["state"] in (CollectorState.RECEIVING.value, CollectorState.STARTING.value):
+        overall = "HEALTHY"
+    elif coll_status["state"] == CollectorState.RETRY_WAITING.value:
+        overall = "DEGRADED"
+    else:
+        overall = "WARNING"
+
+    return jsonify({
+        "status": overall,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "uptime_s": round(time.time() - _START_TIME, 1),
+        "collector": coll_status,
+        "rain": rain_status,
+        "ollama": ollama_status,
+        "tcp_push": tcp_status,
+        "sensor": sensor_info,
+        "database": {
+            "path": DB,
+            "readings_count": readings_count,
+            "last_reading_time": last_db_time,
+        },
+    })
 
 
 @app.route("/api/history")
@@ -704,15 +1108,19 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--green);
     box-shadow: 0 0 8px var(--green), 0 0 16px rgba(0,255,136,0.4);
     display: inline-block;
+    transition: background 0.3s, box-shadow 0.3s;
   }
-  .status-dot.stale { background: var(--red); box-shadow: 0 0 8px var(--red), 0 0 16px rgba(255,51,68,0.4); }
+  .status-dot.live { background: var(--green); box-shadow: 0 0 8px var(--green), 0 0 16px rgba(0,255,136,0.4); }
+  .status-dot.stale { background: var(--yellow); box-shadow: 0 0 8px var(--yellow), 0 0 16px rgba(255,204,0,0.4); }
+  .status-dot.reconnecting { background: var(--purple); box-shadow: 0 0 8px var(--purple), 0 0 16px rgba(189,147,249,0.4); }
+  .status-dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red), 0 0 16px rgba(255,51,68,0.4); }
   .status-bar .sep { color: var(--border); }
 
   /* network info */
   .net-info {
     position: relative; z-index: 1;
     display: flex; flex-wrap: wrap; gap: clamp(8px, 1.5vw, 16px);
-    margin-bottom: clamp(16px, 2vw, 24px);
+    margin-bottom: clamp(10px, 1.5vw, 14px);
     font-family: var(--font); font-size: clamp(0.65em, 1.1vw, 0.75em);
     color: var(--muted);
     padding: 10px 14px;
@@ -723,6 +1131,28 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .net-info .label { color: var(--cyan); }
   .net-info .value { color: var(--text); font-weight: 600; }
   .net-info .sep { color: var(--border); margin: 0 4px; }
+
+  /* telemetry pill bar */
+  .telemetry-bar {
+    position: relative; z-index: 1;
+    display: flex; flex-wrap: wrap; align-items: center; gap: clamp(6px, 1.2vw, 12px);
+    margin-bottom: clamp(16px, 2vw, 24px);
+    font-family: var(--font); font-size: clamp(0.62em, 0.95vw, 0.72em);
+    padding: 6px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .telemetry-item { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .telemetry-item .label { color: var(--muted); text-transform: uppercase; font-size: 0.88em; }
+  .telemetry-badge {
+    padding: 2px 7px; border-radius: 4px; font-weight: 700; font-size: 0.9em;
+    letter-spacing: 0.04em; display: inline-block;
+  }
+  .telemetry-badge.ok   { background: rgba(0,255,136,0.12); color: var(--green);   border: 1px solid rgba(0,255,136,0.3); }
+  .telemetry-badge.warn { background: rgba(255,204,0,0.12); color: var(--yellow);  border: 1px solid rgba(255,204,0,0.3); }
+  .telemetry-badge.crit { background: rgba(255,51,68,0.12); color: var(--red);     border: 1px solid rgba(255,51,68,0.3); }
+  .telemetry-badge.info { background: rgba(0,240,255,0.12); color: var(--cyan);    border: 1px solid rgba(0,240,255,0.3); }
 
   /* ── Cards ────────────────────────────── */
   .cards {
@@ -949,6 +1379,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="sep">│</span>
     <span>ID:<strong id="station-id">--</strong></span>
     <span class="sep">│</span>
+    <span>BAT:<strong id="battery-status">--</strong></span>
+    <span class="sep">│</span>
     <span id="age">--</span>
   </div>
 </div>
@@ -961,6 +1393,16 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span class="label">[WEB]</span> <span class="value">__WEB_URL__</span>
   <span class="sep">│</span>
   <span class="label">[TCP]</span> <span class="value">__TCP_URL__</span>
+</div>
+
+<div class="telemetry-bar" id="telemetry-bar">
+  <div class="telemetry-item"><span class="label">SDR:</span> <span id="telem-collector" class="telemetry-badge info">STOPPED</span></div>
+  <span class="sep">│</span>
+  <div class="telemetry-item"><span class="label">PRECIP:</span> <span id="telem-rain" class="telemetry-badge ok">DRY</span></div>
+  <span class="sep">│</span>
+  <div class="telemetry-item"><span class="label">AI:</span> <span id="telem-ollama" class="telemetry-badge info">INIT</span></div>
+  <span class="sep">│</span>
+  <div class="telemetry-item"><span class="label">TCP:</span> <span id="telem-tcp" class="telemetry-badge info">LISTENING</span></div>
 </div>
 
 <div class="cards">
@@ -1009,7 +1451,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="card rain">
     <div class="icon" id="icon-rain"></div>
     <div class="label">Rain Today</div>
-    <div><span class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></span><span class="trend" id="trend-rain"></span></div>
+    <div><span class="main-val" style="font-size:clamp(1.8em,3vw,2.4em);" id="rain">--<span class="unit"> mm</span></span><span class="trend" id="trend-rain"></span><span id="rain-fsm-badge" class="badge" style="margin-left:8px;vertical-align:middle;display:none;"></span></div>
     <div class="rain-bar"><div class="rain-bar-fill" id="rain-bar" style="width:0%"></div></div>
     <div class="sub" style="margin-top:4px;" id="rain-total"></div>
     <div class="fresh" id="fresh-rain"></div>
@@ -1212,9 +1654,98 @@ function drawChart(canvasId, rows, key, color, fromColor) {
   });
 }
 
+// ── Explicit Frontend Dashboard State Machine (UX / DX / AX) ────────
+const DashboardState = Object.freeze({
+  INITIALIZING: 'INITIALIZING',
+  LIVE: 'LIVE',
+  STALE: 'STALE',
+  RECONNECTING: 'RECONNECTING',
+  OFFLINE: 'OFFLINE'
+});
+
+class DashboardStateMachine {
+  constructor() {
+    this.state = DashboardState.INITIALIZING;
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulSync = null;
+    this.render();
+  }
+
+  transition(event, payload) {
+    payload = payload || {};
+    var prev = this.state;
+    switch (event) {
+      case 'FETCH_SUCCESS':
+        this.consecutiveFailures = 0;
+        this.lastSuccessfulSync = Date.now();
+        var ageSec = payload.ageSec != null ? payload.ageSec : 0;
+        this.state = ageSec > 300 ? DashboardState.STALE : DashboardState.LIVE;
+        break;
+
+      case 'FETCH_FAILURE':
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures === 1) {
+          this.state = DashboardState.RECONNECTING;
+        } else {
+          this.state = DashboardState.OFFLINE;
+        }
+        break;
+
+      case 'RESET':
+      default:
+        this.state = DashboardState.INITIALIZING;
+        break;
+    }
+
+    if (prev !== this.state) {
+      console.log('[dashboard-fsm]', prev, '->', this.state);
+    }
+    this.render(payload);
+    window.wxDashboardState = this.state;
+    document.body.dataset.wxState = this.state;
+  }
+
+  render(payload) {
+    payload = payload || {};
+    var dot = document.getElementById('status-dot');
+    var text = document.getElementById('status-text');
+    var ageEl = document.getElementById('age');
+    if (!dot || !text) return;
+
+    dot.className = 'status-dot ' + this.state.toLowerCase();
+
+    switch (this.state) {
+      case DashboardState.INITIALIZING:
+        text.textContent = 'Connecting...';
+        if (ageEl) ageEl.textContent = '—';
+        break;
+      case DashboardState.LIVE:
+        text.textContent = 'Live';
+        if (ageEl && payload.ageSec != null) {
+          ageEl.textContent = payload.ageSec < 120 ? 'live' : Math.round(payload.ageSec / 60) + 'm ago';
+        }
+        break;
+      case DashboardState.STALE:
+        text.textContent = 'Stale';
+        if (ageEl && payload.ageSec != null) {
+          ageEl.textContent = Math.round(payload.ageSec / 60) + 'm ago';
+        }
+        break;
+      case DashboardState.RECONNECTING:
+        text.textContent = 'Reconnecting...';
+        break;
+      case DashboardState.OFFLINE:
+        text.textContent = 'Offline';
+        if (ageEl) ageEl.textContent = '—';
+        break;
+    }
+  }
+}
+
+const dashboardFsm = new DashboardStateMachine();
+
 // ── Refresh loop ─────────────────────────────
 var lastId = 0;
-var failCount = 0;
 var historyRows = [];
 var _prev = {};
 var _now = 0;
@@ -1240,14 +1771,54 @@ function setFresh(id, ts) {
   else el.textContent = Math.round(s / 60) + 'm ago';
 }
 
+async function refreshTelemetry() {
+  try {
+    var r = await fetch('/api/status');
+    if (!r.ok) return;
+    var s = await r.json();
+
+    // Collector telemetry badge
+    var elColl = document.getElementById('telem-collector');
+    if (elColl && s.collector) {
+      var st = s.collector.state;
+      elColl.textContent = st;
+      elColl.className = 'telemetry-badge ' + (st === 'RECEIVING' ? 'ok' : (st === 'STARTING' || st === 'RETRY_WAITING' ? 'warn' : 'crit'));
+    }
+
+    // Rain FSM badge
+    var elRain = document.getElementById('telem-rain');
+    if (elRain && s.rain) {
+      var rst = s.rain.state;
+      elRain.textContent = rst;
+      elRain.className = 'telemetry-badge ' + (rst === 'ACTIVE_RAIN' ? 'crit' : (rst === 'RECENT_RAIN' ? 'warn' : 'ok'));
+    }
+
+    // AI Ollama badge
+    var elAi = document.getElementById('telem-ollama');
+    if (elAi && s.ollama) {
+      var ost = s.ollama.state;
+      elAi.textContent = ost;
+      elAi.className = 'telemetry-badge ' + (ost === 'READY' ? 'ok' : (ost === 'DEGRADED' ? 'warn' : 'info'));
+    }
+
+    // TCP Push badge
+    var elTcp = document.getElementById('telem-tcp');
+    if (elTcp && s.tcp_push) {
+      var tst = s.tcp_push.state;
+      var count = s.tcp_push.active_clients || 0;
+      elTcp.textContent = tst + (count > 0 ? ' (' + count + ')' : '');
+      elTcp.className = 'telemetry-badge ' + (tst === 'LISTENING' ? 'info' : 'warn');
+    }
+  } catch(e) {}
+}
+
 async function refresh() {
-  var ok = false;
   _now = Date.now();
   try {
     var r = await fetch('/api/current');
-    if (!r.ok) { failCount++; }
-    else {
-      ok = true;
+    if (!r.ok) {
+      dashboardFsm.transition('FETCH_FAILURE', { status: r.status });
+    } else {
       var d = await r.json();
       var t = d.temperature_C;
       var h = d.humidity;
@@ -1304,14 +1875,33 @@ async function refresh() {
       setFresh('fresh-rain', _now);
       _prev.rain = rain;
       document.getElementById('rain-bar').style.width = Math.min(100, ((rain||0) / 20) * 100) + '%';
+
+      // Observable Rain FSM badge update
+      var rainBadge = document.getElementById('rain-fsm-badge');
+      if (rainBadge && d.rain_state) {
+        rainBadge.style.display = 'inline-block';
+        if (d.rain_state === 'ACTIVE_RAIN') {
+          rainBadge.className = 'badge bad';
+          rainBadge.textContent = 'Raining Now 🌧️';
+        } else if (d.rain_state === 'RECENT_RAIN') {
+          rainBadge.className = 'badge warn';
+          rainBadge.textContent = 'Recent Rain';
+        } else {
+          rainBadge.className = 'badge good';
+          rainBadge.textContent = 'Dry';
+        }
+      }
+
       drawCompass(wd);
       document.getElementById('station-id').textContent = d.station_id || '--';
+      var batEl = document.getElementById('battery-status');
+      if (batEl && d.battery_state) {
+        batEl.textContent = d.battery_state;
+        batEl.style.color = d.battery_state === 'LOW' ? 'var(--red)' : (d.battery_state === 'OK' ? 'var(--green)' : 'var(--muted)');
+      }
 
       var age = (Date.now() / 1000) - (new Date(d.time + 'Z').getTime() / 1000);
-      var dot = document.getElementById('status-dot');
-      document.getElementById('age').textContent = age < 120 ? 'live' : Math.round(age / 60) + 'm ago';
-      dot.className = age > 300 ? 'status-dot stale' : 'status-dot';
-      document.getElementById('status-text').textContent = age > 300 ? 'Stale' : 'Live';
+      dashboardFsm.transition('FETCH_SUCCESS', { ageSec: age });
 
       drawGauge('tempGauge', t != null ? t : 0, '°C', 'temp', C.magenta);
       drawGauge('humGauge',  h != null ? h : 50, '%',  'hum',  C.cyan);
@@ -1328,14 +1918,12 @@ async function refresh() {
           (s.rain_today_mm != null ? ' · Today: ' + s.rain_today_mm.toFixed(1) + ' mm' : '');
       } catch(e) {}
     }
-  } catch(e) { failCount++; }
-
-  if (ok) { failCount = 0; }
-  else if (failCount >= 2) {
-    document.getElementById('status-dot').className = 'status-dot stale';
-    document.getElementById('status-text').textContent = 'Offline';
-    document.getElementById('age').textContent = '—';
+  } catch(e) {
+    dashboardFsm.transition('FETCH_FAILURE', { error: e.message });
   }
+
+  // Refresh telemetry status pills
+  refreshTelemetry();
 
   try {
     var url = lastId > 0 ? '/api/history?limit=288&since=' + lastId : '/api/history?limit=288';

@@ -65,7 +65,9 @@ Verify hardware responsiveness and view formatted weather packets directly in yo
 ```bash
 ./check_sdr.py            # Live stream weather packets from 868.3 MHz
 ./check_sdr.py --once     # Verify SDR tuner and exit after 1 packet
-./check_sdr.py --db -n 5  # Display latest 5 records stored in SQLite database
+./check_sdr.py --db       # Display latest record stored in SQLite database
+./check_sdr.py --json     # Output structured diagnostic JSON for agents/automation
+./scan_wx.py --save       # Scan 868 MHz band & save calibrated frequency
 ```
 
 ---
@@ -196,7 +198,8 @@ TCP_PORT=0 ./start.sh
 | Endpoint | Description |
 |---|---|
 | `/` | Cyberpunk HTML dashboard |
-| `/api/current` | Latest reading as JSON (includes `dew_point_C`) |
+| `/api/current` | Latest reading as JSON (includes `dew_point_C`, `rain_state`, `battery_state`, `signal_state`) |
+| `/api/status` | System health & explicit state machine observatory (`collector`, `rain`, `ollama`, `tcp_push`, `sensor`, `database`) |
 | `/api/history?limit=N&since=ID` | Last N readings, optionally since a row id |
 | `/api/stats` | Today's min/max for temperature, humidity, wind |
 
@@ -206,8 +209,10 @@ TCP_PORT=0 ./start.sh
 
 ```
 wxstat/
-├── wx_server.py      # Collector + SQLite + Flask + TCP push + Ollama analysis
-├── check_sdr.py      # Console diagnostic & live SDR / DB weather monitor
+├── wx_server.py      # Collector + SQLite + Flask + TCP push + Ollama analysis + FSMs
+├── check_sdr.py      # Console & JSON diagnostic + live SDR / DB weather monitor
+├── scan_wx.py        # 868 MHz band frequency scanner & auto-calibrator
+├── test_fsm.py       # Unit tests for state machines and API endpoints
 ├── start.sh          # One-command launcher (Linux + macOS)
 ├── push.sh           # git add -A + commit + push helper
 ├── LICENSE           # MIT
@@ -261,3 +266,15 @@ the SDR stick or run: `sudo rmmod dvb_usb_rtl28xxu`
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+---
+
+## ☕ Support & Sponsorship
+
+If you find this project helpful:
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?style=flat&logo=github)](https://github.com/sponsors/oh2fxd)
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?style=flat&logo=paypal)](https://www.paypal.com/paypalme/dxdroid)
+
+- **GitHub Sponsors**: [github.com/sponsors/oh2fxd](https://github.com/sponsors/oh2fxd)
+- **PayPal**: [paypal.me/dxdroid](https://www.paypal.com/paypalme/dxdroid) — 73 de OH2FXD

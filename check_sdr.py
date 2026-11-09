@@ -16,6 +16,18 @@ import sys
 import time
 import unicodedata
 from datetime import datetime
+from enum import Enum
+
+class HardwareState(str, Enum):
+    NOT_INSTALLED = "NOT_INSTALLED"
+    NO_DEVICE = "NO_DEVICE"
+    TUNER_FOUND = "TUNER_FOUND"
+    ERROR = "ERROR"
+
+class DiagnosticState(str, Enum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    CRITICAL = "CRITICAL"
 
 # ANSI Color Codes
 GREEN = "\033[92m"
@@ -325,7 +337,53 @@ def main():
     parser.add_argument("--scan", action="store_true", help="Scan 868MHz band to find weather station frequency")
     parser.add_argument("--dwell", type=int, default=52, help="Dwell time per channel during --scan (default: 52s)")
     parser.add_argument("--last", type=int, default=1, help="Number of recent records to show in --db mode (default: 1)")
+    parser.add_argument("--json", action="store_true", help="Output diagnostic report in JSON format for agents/automation")
     args = parser.parse_args()
+
+    if args.json:
+        binary_ok = bool(shutil.which("rtl_433"))
+        tuner_info = None
+        hw_state = HardwareState.NOT_INSTALLED
+        diag_state = DiagnosticState.CRITICAL
+        
+        if binary_ok:
+            cmd = ["rtl_433", "-Y", "classic", "-f", args.freq, "-s", "250k", "-g", "20", "-T", "2"]
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                _, stderr = proc.communicate(timeout=5)
+            except Exception as e:
+                stderr = str(e)
+
+            for line in stderr.splitlines():
+                if "Found" in line and "tuner" in line:
+                    tuner_info = line.strip()
+                    break
+            
+            if "No supported devices found" in stderr or "Failed to open" in stderr:
+                hw_state = HardwareState.NO_DEVICE
+                diag_state = DiagnosticState.DEGRADED
+            elif tuner_info or "exact sample rate" in stderr.lower():
+                hw_state = HardwareState.TUNER_FOUND
+                diag_state = DiagnosticState.HEALTHY
+            else:
+                hw_state = HardwareState.ERROR
+                diag_state = DiagnosticState.DEGRADED
+
+        readings = read_db_readings(limit=1)
+        latest_reading = readings[0] if readings else None
+
+        result = {
+            "diagnostic_state": diag_state.value,
+            "binary_installed": binary_ok,
+            "hardware_state": hw_state.value,
+            "tuner_info": tuner_info,
+            "frequency": args.freq,
+            "database_has_readings": bool(latest_reading),
+            "latest_reading": latest_reading,
+            "timestamp": datetime.now().isoformat(),
+        }
+        print(json.dumps(result, indent=2))
+        return
 
     print(colored("================================───────────────────────────", BOLD))
     print(colored("         WXSTAT RTL-SDR & 868MHz HARDWARE CHECK         ", BOLD + CYAN))

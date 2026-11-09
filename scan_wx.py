@@ -14,6 +14,14 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from enum import Enum
+
+class ScanState(str, Enum):
+    IDLE = "IDLE"
+    SCANNING = "SCANNING"
+    LOCKED = "LOCKED"
+    NO_SIGNAL = "NO_SIGNAL"
+    ABORTED = "ABORTED"
 
 # ANSI colors
 GREEN = "\033[92m"
@@ -186,18 +194,23 @@ def main():
     parser.add_argument("--gain", default="20", help="RTL-SDR tuner gain in dB (default: 20)")
     parser.add_argument("--hop", action="store_true", help="Use rtl_433 native round-robin frequency hopping")
     parser.add_argument("--save", action="store_true", help="Automatically save detected frequency to wx_config.json")
+    parser.add_argument("--json", action="store_true", help="Output scan outcome in JSON format for agents/automation")
     args = parser.parse_args()
 
-    print(colored("==========================================================", BOLD))
-    print(colored("       868 MHz WX STATION FREQUENCY SCANNER & CALIBRATOR   ", BOLD + CYAN))
-    print(colored("==========================================================", BOLD))
+    if not args.json:
+        print(colored("==========================================================", BOLD))
+        print(colored("       868 MHz WX STATION FREQUENCY SCANNER & CALIBRATOR   ", BOLD + CYAN))
+        print(colored("==========================================================", BOLD))
 
     if not check_rtl433():
+        if args.json:
+            print(json.dumps({"scan_state": ScanState.NO_SIGNAL.value, "error": "rtl_433 binary missing"}))
         sys.exit(1)
 
-    print(f"Target Frequencies: {', '.join(args.freqs)}")
-    print(f"Sensor burst interval for WH1080 is ~48s; testing with {args.dwell}s dwell.")
-    print()
+    if not args.json:
+        print(f"Target Frequencies: {', '.join(args.freqs)}")
+        print(f"Sensor burst interval for WH1080 is ~48s; testing with {args.dwell}s dwell.")
+        print()
 
     found_packet = None
 
@@ -221,6 +234,21 @@ def main():
         if isinstance(best_freq, (int, float)):
             best_freq = f"{best_freq / 1e6:.3f}M"
 
+        if args.json:
+            out = {
+                "scan_state": ScanState.LOCKED.value,
+                "best_frequency": best_freq,
+                "model": found_packet.get("model", "Unknown"),
+                "sensor_id": found_packet.get("id"),
+                "temperature_C": found_packet.get("temperature_C"),
+                "humidity": found_packet.get("humidity"),
+                "saved_to_config": bool(args.save),
+            }
+            if args.save:
+                save_config(best_freq, found_packet.get("id"), found_packet.get("model"))
+            print(json.dumps(out, indent=2))
+            return
+
         print("\n" + colored("🎯 WEATHER STATION FOUND!", GREEN + BOLD))
         print(f"   Frequency:    {colored(best_freq, CYAN + BOLD)}")
         print(f"   Model:        {found_packet.get('model', 'Unknown')}")
@@ -235,6 +263,14 @@ def main():
             if ans in ("", "y", "yes"):
                 save_config(best_freq, found_packet.get("id"), found_packet.get("model"))
     else:
+        if args.json:
+            print(json.dumps({
+                "scan_state": ScanState.NO_SIGNAL.value,
+                "tested_frequencies": args.freqs,
+                "dwell_s": args.dwell,
+            }, indent=2))
+            return
+
         print(colored("\n⚠️  No weather station signal detected in this scan cycle.", YELLOW))
         print("Tips:")
         print("  1. Verify the transmitter has good batteries.")
